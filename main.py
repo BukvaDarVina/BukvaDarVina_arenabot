@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import sys
+import os
+
+AGENT_TOKEN = os.getenv("AGENT_TOKEN", "default_arena_token")
 
 # Настройка логирования
 logging.basicConfig(
@@ -38,10 +41,12 @@ async def main():
     translator = GameStateTranslator()
 
     logger.info("Инициализация API клиента и головы (LLM-Оркестратор)...")
-    client = ArenaClient(base_url=BASE_URL)
+    client = ArenaClient(base_url=BASE_URL, agent_token=AGENT_TOKEN)
+    await client.register_agent("ArenaChampionBot")
+    
     orchestrator = LLMOrchestrator(client=client, db=db, engines=engines, translator=translator)
 
-    # 2. Разведка: чтение документации платформы
+    # Выполнение разведки
     logger.info("Выполнение разведки: чтение точек входа платформы...")
     docs_to_read = ['/start.md', '/agents.md', '/llms.txt']
     await client.fetch_documents(docs_to_read)
@@ -54,29 +59,25 @@ async def main():
             
             target_table_id = None
             for table in open_tables:
-                opponent = table.get("opponent_name", "Unknown")
-                is_rated = table.get("is_rated", True)
                 table_id = table.get("id")
-                
-                logger.info(f"Найден стол {table_id}: противник [{opponent}], рейтинговый: {is_rated}")
-                
-                # Ищем подходящий стол (например, с Robik или любой свободный)
                 if table_id:
                     target_table_id = table_id
                     break
-
+                    
+            if not target_table_id:
+                logger.info("Свободных столов для подключения нет. Создаем собственный стол...")
+                target_table_id = await client.create_table("Chess")
+                
             if target_table_id:
-                logger.info(f"Попытка занять найденный стол ID: {target_table_id}...")
+                logger.info(f"Работа со столом ID: {target_table_id}...")
                 joined = await client.sit_at_table(target_table_id)
                 
                 if joined:
-                    logger.info("Успешная посадка за стол! Передача управления оркестратору матча.")
+                    logger.info("Успешное подключение! Запуск игрового цикла.")
                     await orchestrator.play_match(target_table_id)
                 else:
-                    logger.warning("Не удалось сесть за стол.")
-            else:
-                logger.info("Свободных столов нет. Повторный поиск через 10 секунд...")
-                
+                    logger.warning("Не удалось сесть за стол. Пауза 10 секунд...")
+            
             await asyncio.sleep(10)
                 
     except asyncio.CancelledError:

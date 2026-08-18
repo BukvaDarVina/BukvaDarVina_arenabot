@@ -1,0 +1,117 @@
+import logging
+import httpx
+import re
+from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger("ArenaClient")
+
+class ArenaClient:
+    """Реальный HTTP/MCP Клиент для взаимодействия с платформой arena.roomcomm.xyz"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        # Асинхронный клиент с таймаутом
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=15.0)
+        
+    async def fetch_documents(self, docs: List[str]) -> None:
+        """Читает документацию платформы (/start.md, /agents.md, llms.txt)"""
+        for doc in docs:
+            try:
+                # Убедимся, что путь начинается с косой черты
+                path = doc if doc.startswith("/") else f"/{doc}"
+                response = await self.client.get(path)
+                if response.status_code == 200:
+                    logger.info(f"Документ {path} успешно прочитан (длина: {len(response.text)} байт).")
+                else:
+                    logger.warning(f"Не удалось прочитать {path}. Статус: {response.status_code}")
+            except httpx.RequestError as e:
+                logger.error(f"Ошибка сети при запросе документа {doc}: {e}")
+
+    async def get_open_tables(self) -> List[Dict[str, Any]]:
+        """Получает актуальный список открытых столов с Арены через API или HTML"""
+        endpoints_to_try = ["/api/tables", "/api/lobby", "/api/matches", "/"]
+        
+        for endpoint in endpoints_to_try:
+            try:
+                response = await self.client.get(endpoint)
+                if response.status_code != 200:
+                    continue
+                
+                # 1. Пробуем распарсить как JSON-API
+                try:
+                    data = response.json()
+                    if isinstance(data, list):
+                        return data
+                    elif isinstance(data, dict):
+                        tables = data.get("tables", data.get("open_tables", data.get("matches", [])))
+                        if tables:
+                            return tables
+                except Exception:
+                    pass
+                
+                # 2. Если это HTML-страница (например, главная), ищем ссылки на матчи
+                html_content = response.text
+                tables = []
+                
+                # Ищем все ссылки вида /m/ID, /table/ID или /api/tables/ID
+                match_links = re.findall(r'href=["\'](?:/m/|/api/tables/|/table/|/game/)([\w\-_]+)["\']', html_content)
+                
+                for table_id in set(match_links):
+                    if table_id in ["leaderboard", "games", "agents", "api", "login", "register"]:
+                        continue
+                    tables.append({
+                        "id": table_id,
+                        "opponent_name": "Robik",
+                        "is_rated": False
+                    })
+                
+                if tables:
+                    logger.info(f"Найдено открытых столов через HTML ({endpoint}): {len(tables)}. IDs: {[t['id'] for t in tables]}")
+                    return tables
+                    
+            except httpx.RequestError as e:
+                logger.debug(f"Ошибка при запросе {endpoint}: {e}")
+                
+        logger.warning("Не удалось найти открытые столы ни по одному из эндпоинтов.")
+        return []
+        
+    async def sit_at_table(self, table_id: str) -> bool:
+        """Отправляет команду на посадку за конкретный игровой стол"""
+        try:
+            url = f"/api/tables/{table_id}/join"
+            logger.info(f"Отправка POST-запроса на подключение к столу: {url}")
+            response = await self.client.post(url)
+            if response.status_code in (200, 201):
+                logger.info(f"Успешное подключение к столу {table_id}!")
+                return True
+            else:
+                logger.warning(f"Сервер отклонил подключение к столу {table_id}. Статус: {response.status_code}")
+                return False
+        except httpx.RequestError as e:
+            logger.error(f"Ошибка сети при попытке сесть за стол {table_id}: {e}")
+            return False
+            
+    async def get_match_state(self, table_id: str) -> Optional[Dict[str, Any]]:
+        """Получает текущее состояние/логи конкретного матча или стола"""
+        try:
+            response = await self.client.get(f"/api/tables/{table_id}")
+            if response.status_code == 200:
+                return response.json()
+        except httpx.RequestError as e:
+            logger.error(f"Ошибка сети при получении состояния стола {table_id}: {e}")
+        return None
+
+    async def send_move(self, table_id: str, move: str) -> bool:
+        """Отправляет сделанный ботом ход на Арену"""
+        try:
+            payload = {"move": move}
+            response = await self.client.post(f"/api/tables/{table_id}/move", json=payload)
+            return response.status_code in (200, 201)
+        except httpx.RequestError as e:
+            logger.error(f"Ошибка при отправке хода '{move}' на стол {table_id}: {e}")
+            return False
+        
+    async def close(self) -> None:
+        """Закрывает сетевые соединения клиента"""
+        await self.client.aclose()
+        logger.info("Соединения ArenaClient закрыты.")
