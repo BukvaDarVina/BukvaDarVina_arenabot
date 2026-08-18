@@ -11,15 +11,12 @@ logging.basicConfig(
 logger = logging.getLogger("ArenaChampionBot")
 
 # Заглушки для импортов (модули будут реализованы в следующих PR)
-try:
-    from core.client import ArenaClient
-    from core.orchestrator import LLMOrchestrator
-    from memory.db import LocalMemoryDB
-    from parsers.translator import GameStateTranslator
-    from engines.manager import EngineManager
-except ImportError:
-    logger.warning("Внутренние модули (core, memory, parsers, engines) еще не реализованы. Запуск в режиме каркаса.")
-    ArenaClient = LLMOrchestrator = LocalMemoryDB = GameStateTranslator = EngineManager = None
+from core.client import ArenaClient
+from core.orchestrator import LLMOrchestrator
+from memory.db import LocalMemoryDB
+from parsers.translator import GameStateTranslator
+from engines.manager import EngineManager
+
 
 BASE_URL = "https://arena.roomcomm.xyz"
 
@@ -51,38 +48,51 @@ async def main():
     docs_to_read = ['/start.md', '/agents.md', '/llms.txt']
     await client.fetch_documents(docs_to_read)
 
-    # 3. Подключение к лобби
-    logger.info("Запрос состояния лобби и поиск открытых столов...")
-    open_tables = await client.get_open_tables()
-    
-    # 4. Поиск тренировочной игры (Критерий: играем с Robik в not rated)
-    target_table_id = None
-    for table in open_tables:
-        opponent = table.get("opponent_name", "")
-        is_rated = table.get("is_rated", True)
-        
-        if "Robik" in opponent and not is_rated:
-            target_table_id = table.get("id")
-            logger.info(f"Найден подходящий нерейтинговый стол с {opponent}: {target_table_id}")
-            break
-            
-    if target_table_id:
-        logger.info(f"Отправка команды на посадку за стол {target_table_id}...")
-        joined = await client.sit_at_table(target_table_id)
-        
-        if joined:
-            logger.info("Успешная посадка! Передача управления LLM-Оркестратору.")
-            # Запуск основного игрового цикла, где Оркестратор парсит ходы и дергает движки
-            await orchestrator.play_match(target_table_id)
-        else:
-            logger.error("Ошибка при попытке сесть за стол. Возможно, он уже занят.")
-    else:
-        logger.info("Свободных нерейтинговых столов с Robik в данный момент нет. Переход в режим ожидания...")
+    try:
+        while True:
 
-    # Корректное завершение работы
-    await db.disconnect()
-    await client.close()
-    logger.info("Работа бота завершена.")
+            # 3. Подключение к лобби
+            logger.info("Запрос состояния лобби и поиск открытых столов...")
+            open_tables = await client.get_open_tables()
+            
+            # 4. Поиск тренировочной игры (Критерий: играем с Robik в not rated)
+            target_table_id = None
+            for table in open_tables:
+                opponent = table.get("opponent_name", "")
+                is_rated = table.get("is_rated", True)
+                
+                if "Robik" in opponent and not is_rated:
+                    target_table_id = table.get("id")
+                    logger.info(f"Найден подходящий нерейтинговый стол с {opponent}: {target_table_id}")
+                    break
+                    
+            if target_table_id:
+                logger.info(f"Отправка команды на посадку за стол {target_table_id}...")
+                joined = await client.sit_at_table(target_table_id)
+                
+                if joined:
+                    logger.info("Успешная посадка! Передача управления LLM-Оркестратору.")
+                    # Запуск основного игрового цикла, где Оркестратор парсит ходы и дергает движки
+                    await orchestrator.play_match(target_table_id)
+                else:
+                    logger.error("Ошибка при попытке сесть за стол. Возможно, он уже занят.")
+            else:
+                logger.info("Свободных нерейтинговых столов с Robik нет. Повторный поиск через 10 секунд...")
+                await asyncio.sleep(10)
+                
+            # Корректное завершение работы
+            # await db.disconnect()
+            # await client.close()
+            # logger.info("Работа бота завершена.")
+            
+    except asyncio.CancelledError:
+        logger.info("Основной процесс прерван.")
+    finally:
+        # Корректное завершение работы
+        engines.shutdown()
+        await db.disconnect()
+        await client.close()
+        logger.info("Работа бота завершена.")
 
 if __name__ == "__main__":
     # Проверка версии Python (требуется 3.14.6 согласно спецификации)

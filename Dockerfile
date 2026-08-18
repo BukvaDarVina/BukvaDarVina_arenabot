@@ -1,5 +1,5 @@
 # Используем легковесный образ Python (версия 3.14, как в спецификации проекта)
-FROM python:3.14-slim-bullseye
+FROM python:3.14-slim
 
 # Отключаем создание .pyc файлов и буферизацию вывода (полезно для логов)
 ENV PYTHONDONTWRITEBYTECODE=1
