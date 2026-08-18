@@ -15,7 +15,6 @@ class ArenaClient:
         self.base_url = base_url.rstrip("/")
         self.token_file = "data/token.txt"
         
-        # Пытаемся загрузить сохраненный токен с прошлого запуска, если он есть
         self.token = agent_token or self._load_token_from_file()
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=15.0)
         
@@ -60,14 +59,13 @@ class ArenaClient:
                 logger.error(f"Ошибка сети при запросе документа {doc}: {e}")
 
     async def register_agent(self, agent_name: str = "ArenaChampionBot") -> bool:
-        """Регистрация агента с авто-генерацией уникального имени при конфликте 409 и сохранением токена"""
+        """Регистрация агента с авто-генерацией уникального имени при конфликте 409"""
         if self.token and str(self.token).startswith("ak_"):
             logger.info("Используется уже имеющийся валидный токен авторизации.")
             return True
 
         base_name = agent_name
         for attempt in range(5):
-            # Если имя занято, на каждой новой попытке добавляем случайный хвостик
             current_name = base_name if attempt == 0 else f"{base_name}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=4))}"
             
             payload = {
@@ -90,8 +88,6 @@ class ArenaClient:
                         self._save_token_to_file(token)
                         logger.info(f"Успешная регистрация под именем '{current_name}'! Получен ключ: {token[:10]}...")
                         return True
-                    else:
-                        logger.warning(f"Сервер ответил успешно, но ключ не найден в ответе: {data}")
                 elif response.status_code == 409:
                     logger.warning(f"Имя '{current_name}' уже занято (409 Conflict). Пробуем другое...")
                     continue
@@ -103,6 +99,21 @@ class ArenaClient:
                 break
                 
         return False
+
+    async def get_current_seated_table(self) -> Optional[str]:
+        """Проверяет через /api/keys/me, не сидит ли бот уже за активным столом"""
+        try:
+            headers = self._get_auth_headers()
+            response = await self.client.get("/api/keys/me", headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                seated = data.get("seated_at") or data.get("match") or data.get("table_id") or data.get("table")
+                if seated:
+                    logger.info(f"Обнаружен активный стол из /api/keys/me: {seated}")
+                    return seated
+        except Exception:
+            pass
+        return None
 
     async def get_open_tables(self) -> List[Dict[str, Any]]:
         """Получает список открытых столов ожидания"""
@@ -126,11 +137,16 @@ class ArenaClient:
         return []
 
     async def create_table(self, game_type: str = "chess") -> Optional[str]:
-        """Создает новый открытый стол"""
+        """Создает новый открытый стол или возвращает существующий активный"""
         try:
             headers = self._get_auth_headers()
             
-            # Запрашиваем список поддерживаемых игр
+            # 1. Проверяем, не сидим ли мы уже за столом
+            seated = await self.get_current_seated_table()
+            if seated:
+                return seated
+
+            # 2. Запрашиваем поддерживаемые игры
             games_resp = await self.client.get("/api/games", headers=headers)
             if games_resp.status_code == 200:
                 games_data = games_resp.json()
@@ -147,9 +163,25 @@ class ArenaClient:
             response = await self.client.post("/api/tables", json=payload, headers=headers)
             if response.status_code in (200, 201):
                 data = response.json()
-                table_id = data.get("id") or data.get("table_id")
+                # Универсально ищем ID в любых возможных полях ответа
+                table_id = (
+                    data.get("id") or 
+                    data.get("table_id") or 
+                    data.get("match") or 
+                    data.get("table") or 
+                    data.get("match_id")
+                )
                 logger.info(f"Успешно создан новый стол с ID: {table_id}")
                 return table_id
+            elif response.status_code == 409:
+                # Если ключ уже привязан к матчу, вытаскиваем ID из текста ошибки сервера
+                error_text = response.text
+                match = re.search(r'match\s+([A-Z0-9]+)', error_text)
+                if match:
+                    table_id = match.group(1)
+                    logger.info(f"Обнаружен существующий активный стол из ошибки 409: {table_id}")
+                    return table_id
+                logger.warning(f"Конфликт создания стола: {error_text}")
             else:
                 logger.warning(f"Не удалось создать стол. Статус: {response.status_code} - {response.text}")
         except Exception as e:
