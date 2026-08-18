@@ -222,6 +222,20 @@ class ArenaClient:
             return response.status_code in (200, 201)
         except Exception:
             return False
+
+    async def leave_table(self, table_id: str) -> bool:
+        """Покидает стол, если партия зависла или противник сбежал"""
+        try:
+            headers = self._get_auth_headers()
+            response = await self.client.post(f"/api/matches/{table_id}/leave", headers=headers)
+            if response.status_code in (200, 201):
+                logger.info(f"Успешно покинули зависший стол {table_id}.")
+                return True
+            else:
+                logger.warning(f"Не удалось покинуть стол {table_id}. Статус: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Ошибка при выходе из-за стола: {e}")
+        return False
         
     async def close(self) -> None:
         await self.client.aclose()

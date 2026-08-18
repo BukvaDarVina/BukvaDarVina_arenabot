@@ -54,6 +54,15 @@ async def main():
     # 3. Боевой цикл: непрерывный поиск столов и участие в матчах
     try:
         while True:
+            # СНАЧАЛА проверяем, не зависли ли мы уже в каком-то матче после перезагрузки
+            active_table = await client.get_current_seated_table()
+            if active_table:
+                logger.info(f"Обнаружен незавершенный матч на столе {active_table}. Возвращаемся в игру!")
+                await orchestrator.play_match(active_table)
+                # После завершения/выхода из матча делаем паузу и ищем новый
+                await asyncio.sleep(5)
+                continue
+
             logger.info("Запрос состояния лобби и поиск открытых столов...")
             open_tables = await client.get_open_tables()
             
@@ -65,18 +74,18 @@ async def main():
                     break
                     
             if not target_table_id:
-                logger.info("Свободных столов для подключения нет. Создаем собственный стол...")
-                target_table_id = await client.create_table("Chess")
+                logger.info("Свободных столов нет. Создаем собственный стол...")
+                target_table_id = await client.create_table("chess") # или другую игру
                 
             if target_table_id:
-                logger.info(f"Работа со столом ID: {target_table_id}...")
+                logger.info(f"Попытка присоединиться к столу ID: {target_table_id}...")
                 joined = await client.sit_at_table(target_table_id)
                 
                 if joined:
-                    logger.info("Успешное подключение! Запуск игрового цикла.")
+                    logger.info("Успешная посадка! Запуск игрового цикла.")
                     await orchestrator.play_match(target_table_id)
                 else:
-                    logger.warning("Не удалось сесть за стол. Пауза 10 секунд...")
+                    logger.warning("Не удалось сесть за стол (возможно, кто-то успел раньше).")
             
             await asyncio.sleep(10)
                 
