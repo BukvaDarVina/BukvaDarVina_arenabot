@@ -10,13 +10,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ArenaChampionBot")
 
-# Заглушки для импортов (модули будут реализованы в следующих PR)
+# Прямые импорты модулей бота
 from core.client import ArenaClient
 from core.orchestrator import LLMOrchestrator
 from memory.db import LocalMemoryDB
 from parsers.translator import GameStateTranslator
 from engines.manager import EngineManager
-
 
 BASE_URL = "https://arena.roomcomm.xyz"
 
@@ -24,82 +23,77 @@ async def main():
     logger.info("Запуск Arena Champion Bot (Архитектура «Франкенштейн»)...")
     logger.info(f"Целевая платформа: {BASE_URL}")
     
-    if not ArenaClient:
-        logger.error("Остановка: Необходима реализация структуры каталогов (core/, memory/, parsers/, engines/).")
-        return
-
-    # 1. Инициализация слоев (Сборка "Франкенштейна")
-    logger.info("Инициализация слоя памяти (PostgreSQL/SQLite)...")
+    # 1. Инициализация слоев
+    logger.info("Инициализация слоя памяти (SQLite)...")
     db = LocalMemoryDB()
     await db.connect()
 
     logger.info("Инициализация мышц (Stockfish, Алгоритм Кнута, Probability Grid, Минимакс)...")
     engines = EngineManager()
+    if not engines.initialize():
+        logger.error("Критическая ошибка: Не удалось инициализировать игровые движки (проверьте Stockfish).")
+        return
 
-    logger.info("Инициализация нервной системы (Транслятор состояний и Regex/LLM парсеры)...")
+    logger.info("Инициализация нервной системы (Транслятор состояний и Regex-парсеры)...")
     translator = GameStateTranslator()
 
     logger.info("Инициализация API клиента и головы (LLM-Оркестратор)...")
     client = ArenaClient(base_url=BASE_URL)
     orchestrator = LLMOrchestrator(client=client, db=db, engines=engines, translator=translator)
 
-    # 2. Разведка и чтение документации (Чек-лист первого PR)
+    # 2. Разведка: чтение документации платформы
     logger.info("Выполнение разведки: чтение точек входа платформы...")
     docs_to_read = ['/start.md', '/agents.md', '/llms.txt']
     await client.fetch_documents(docs_to_read)
 
+    # 3. Боевой цикл: непрерывный поиск столов и участие в матчах
     try:
         while True:
-
-            # 3. Подключение к лобби
             logger.info("Запрос состояния лобби и поиск открытых столов...")
             open_tables = await client.get_open_tables()
             
-            # 4. Поиск тренировочной игры (Критерий: играем с Robik в not rated)
             target_table_id = None
             for table in open_tables:
-                opponent = table.get("opponent_name", "")
+                opponent = table.get("opponent_name", "Unknown")
                 is_rated = table.get("is_rated", True)
+                table_id = table.get("id")
                 
-                if "Robik" in opponent and not is_rated:
-                    target_table_id = table.get("id")
-                    logger.info(f"Найден подходящий нерейтинговый стол с {opponent}: {target_table_id}")
+                logger.info(f"Найден стол {table_id}: противник [{opponent}], рейтинговый: {is_rated}")
+                
+                # Ищем подходящий стол (например, с Robik или любой свободный)
+                if table_id:
+                    target_table_id = table_id
                     break
                     
             if target_table_id:
-                logger.info(f"Отправка команды на посадку за стол {target_table_id}...")
+                logger.info(f"Попытка занять стол {target_table_id}...")
                 joined = await client.sit_at_table(target_table_id)
                 
                 if joined:
-                    logger.info("Успешная посадка! Передача управления LLM-Оркестратору.")
-                    # Запуск основного игрового цикла, где Оркестратор парсит ходы и дергает движки
+                    logger.info("Успешная посадка за стол! Передача управления оркестратору матча.")
                     await orchestrator.play_match(target_table_id)
                 else:
-                    logger.error("Ошибка при попытке сесть за стол. Возможно, он уже занят.")
+                    logger.warning("Не удалось сесть за стол (возможно, его занял другой агент).")
             else:
-                logger.info("Свободных нерейтинговых столов с Robik нет. Повторный поиск через 10 секунд...")
-                await asyncio.sleep(10)
+                logger.info("Свободных столов нет. Повторный поиск через 10 секунд...")
                 
-            # Корректное завершение работы
-            # await db.disconnect()
-            # await client.close()
-            # logger.info("Работа бота завершена.")
-            
+            await asyncio.sleep(10)
+                
     except asyncio.CancelledError:
-        logger.info("Основной процесс прерван.")
+        logger.info("Игровой процесс прерван.")
     finally:
-        # Корректное завершение работы
+        # Корректное завершение работы всех систем
         engines.shutdown()
         await db.disconnect()
         await client.close()
-        logger.info("Работа бота завершена.")
+        logger.info("Бот успешно остановлен.")
 
 if __name__ == "__main__":
-    # Проверка версии Python (требуется 3.14.6 согласно спецификации)
-    if sys.version_info < (3, 14):
-        logger.warning(f"Текущая версия Python: {sys.version}. Рекомендуется 3.14.6.")
+    if sys.version_info < (3, 10):
+        logger.error("Требуется Python 3.10 или выше.")
+        sys.exit(1)
         
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("\nПроцесс прерван пользователем (Ctrl+C). Остановка...")
+        logger.info("\nОстановка бота по запросу пользователя (Ctrl+C)...")
