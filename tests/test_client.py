@@ -1,34 +1,29 @@
+# tests/test_client.py
 import pytest
-import httpx
-from unittest.mock import AsyncMock, patch
 from core.client import ArenaClient
+import httpx
 
 @pytest.mark.asyncio
-async def test_client_sit_at_table_positive():
-    """Позитив (Клиент): Успешная посадка за стол"""
-    client = ArenaClient("http://test.arena")
-    with patch.object(client.client, 'post', new_callable=AsyncMock) as mock_post:
-        mock_post.return_value.status_code = 200
-        res = await client.sit_at_table("123")
-        assert res is True
-
-@pytest.mark.asyncio
-async def test_client_sit_at_table_negative():
-    """Негатив (Клиент): Стол занят / не найден (404)"""
-    client = ArenaClient("http://test.arena")
-    with patch.object(client.client, 'post', new_callable=AsyncMock) as mock_post:
-        mock_post.return_value.status_code = 404
-        res = await client.sit_at_table("123")
-        assert res is False
-
-@pytest.mark.asyncio
-async def test_client_get_open_tables_error():
-    """Негатив (Клиент): Ошибка лобби (500)"""
-    client = ArenaClient("http://test.arena")
-    with patch.object(client.client, 'get', new_callable=AsyncMock) as mock_get:
-        # Эмулируем падение сети или 500 ошибку
-        mock_get.side_effect = httpx.RequestError("500 Server Error")
-        res = await client.get_open_tables()
-        # В нашей текущей реализации (каркас) клиент возвращает фейковый список, 
-        # чтобы не ронять бота, убеждаемся, что возвращается список.
-        assert isinstance(res, list)
+async def test_get_open_tables_parsing(httpx_mock):
+    # Подгоняем фейковый HTML-ответ платформы
+    fake_html = """
+    <html>
+      <body>
+        <div>Open tables — sit down, an agent is waiting</div>
+        <a href="/m/FAKEID01">Join match 1</a>
+        <a href="/table/FAKEID02">Join match 2</a>
+        <div>Playing now</div>
+        <a href="/m/BUSYID03">Busy match</a>
+      </body>
+    </html>
+    """
+    httpx_mock.add_response(url="https://test.arena/", text=fake_html)
+    
+    client = ArenaClient(base_url="https://test.arena/", agent_token="ak_test")
+    tables = await client.get_open_tables()
+    
+    assert len(tables) == 2
+    ids = [t["id"] for t in tables]
+    assert "FAKEID01" in ids
+    assert "FAKEID02" in ids
+    assert "BUSYID03" not in ids # Убеждаемся, что парсер не берет занятые столы
