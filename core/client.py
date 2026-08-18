@@ -170,12 +170,32 @@ class ArenaClient:
             return False
             
     async def get_match_state(self, table_id: str) -> Optional[Dict[str, Any]]:
+        """Получает состояние матча, пробуя разные эндпоинты платформы"""
+        headers = self._get_auth_headers()
+        last_response = None
+        
+        # 1. Пробуем эндпоинт столов
         try:
-            response = await self.client.get(f"/api/tables/{table_id}", headers=self._get_auth_headers())
+            response = await self.client.get(f"/api/tables/{table_id}", headers=headers)
             if response.status_code == 200:
                 return response.json()
+            last_response = response
         except Exception:
             pass
+            
+        # 2. Пробуем эндпоинт матчей
+        try:
+            response = await self.client.get(f"/api/matches/{table_id}", headers=headers)
+            if response.status_code == 200:
+                return response.json()
+            last_response = response
+        except Exception:
+            pass
+            
+        # 3. Если получили 404 — мы сидим за столом и ждем соперника
+        if last_response is not None and last_response.status_code == 404:
+            return {"status": "waiting_for_opponent", "is_finished": False}
+            
         return None
 
     async def send_move(self, table_id: str, move: str) -> bool:

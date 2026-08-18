@@ -33,7 +33,7 @@ async def main():
     translator = GameStateTranslator()
     client = ArenaClient(base_url=BASE_URL, agent_token=AGENT_TOKEN)
     
-    await client.register_agent("ArenaChampionBot")
+    await client.register_agent("Frank_by_DVB")
     
     orchestrator = LLMOrchestrator(client=client, db=db, engines=engines, translator=translator)
 

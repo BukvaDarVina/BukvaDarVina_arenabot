@@ -1,0 +1,147 @@
+import asyncio
+import logging
+import time
+from typing import Any, Optional
+
+logger = logging.getLogger("LLMOrchestrator")
+
+class LLMOrchestrator:
+    """
+    Голова «Франкенштейна»: оркестратор, управляющий ходом матча.
+    Связывает сетевой клиент, базу данных, языковую модель/транслятор и математические движки.
+    """
+    def __init__(self, client: Any, db: Any, engines: Any, translator: Any):
+        self.client = client
+        self.db = db
+        self.engines = engines
+        self.translator = translator
+
+    async def play_match(self, table_id: str) -> None:
+        logger.info(f"Запуск игрового цикла за столом {table_id}...")
+        
+        last_processed_move_index = 0
+        game_type = "Chess"
+        last_state_change_time = time.time()
+        
+        try:
+            while True:
+                state = await self.client.get_match_state(table_id)
+                
+                # Если сервер не ответил вовсе (сетевой сбой)
+                if not state:
+                    logger.warning(f"Не удалось получить состояние стола {table_id}. Повтор через 5с...")
+                    await asyncio.sleep(5)
+                    continue
+                    
+                # Обработка режима ожидания соперника (404 Not Found на сервере)
+                if state.get("status") == "waiting_for_opponent":
+                    # Если сидим в ожидании дольше 5 минут (300 сек) — покидаем стол
+                    if time.time() - last_state_change_time > 300:
+                        logger.warning(f"Таймаут: Никто не присоединился к столу {table_id} за 5 минут. Покидаем его.")
+                        await self.client.leave_table(table_id)
+                        break
+                        
+                    logger.info(f"Ожидание соперника за столом {table_id}...")
+                    await asyncio.sleep(5)
+                    continue
+
+                # Игра началась/активна — обновляем таймер активности
+                game_type = state.get("game_type", state.get("game", game_type))
+                moves_history = state.get("moves", [])
+                
+                # 1. Проверка завершения матча
+                if state.get("is_finished", False) or state.get("status") in ["finished", "aborted", "abandoned"]:
+                    winner = state.get("winner", "Unknown")
+                    logger.info(f"Матч {table_id} завершен! Победитель: {winner}")
+                    
+                    # Сохраняем результат в SQLite базу данных
+                    if hasattr(self.db, 'save_match'):
+                        try:
+                            await self.db.save_match(table_id, game_type, winner, moves_history)
+                        except Exception as e:
+                            logger.error(f"Ошибка при сохранении матча в БД: {e}")
+                            
+                    await self.client.leave_table(table_id)
+                    break
+
+                # 2. Логика определения чей сейчас ход
+                current_moves_len = len(moves_history)
+                new_moves_available = current_moves_len > last_processed_move_index
+                
+                # Проверяем флаг очереди хода от сервера или вычисляем для первого хода
+                is_my_turn = state.get("is_my_turn", False)
+                if current_moves_len == 0 and not new_moves_available:
+                    # Если история ходов пуста — значит мы ходим первыми (белыми)
+                    is_my_turn = True
+
+                if new_moves_available:
+                    last_state_change_time = time.time()  # Сброс таймера таймаута
+                    latest_move = moves_history[-1]
+                    logger.info(f"Новый ход в матче: '{latest_move}'")
+                    last_processed_move_index = current_moves_len
+                    is_my_turn = True
+
+                # 3. Выполнение хода
+                if is_my_turn:
+                    parsed_move = None
+                    if current_moves_len > 0:
+                        parsed_move = self.translator.parse_move(game_type, moves_history[-1])
+                    
+                    bot_move = self._calculate_response_move(game_type, state, parsed_move)
+                    
+                    if bot_move:
+                        logger.info(f"Движок предложил ход: {bot_move}. Отправка на сервер...")
+                        success = await self.client.send_move(table_id, bot_move)
+                        if success:
+                            logger.info("Ход успешно принят платформой.")
+                            last_processed_move_index += 1
+                            last_state_change_time = time.time()
+                            await asyncio.sleep(2)
+                        else:
+                            logger.warning(f"Платформа отклонила ход {bot_move}. Повтор через 2с...")
+                            await asyncio.sleep(2)
+                    else:
+                        logger.warning(f"Не удалось рассчитать ход для игры '{game_type}'. Ожидание...")
+                        await asyncio.sleep(3)
+
+                # Таймаут на случай, если игра зависла без активности на 5 минут
+                if time.time() - last_state_change_time > 300:
+                    logger.warning(f"Таймаут: Игра на столе {table_id} не обновляется 5 минут. Покидаем стол.")
+                    await self.client.leave_table(table_id)
+                    break
+
+                await asyncio.sleep(2)
+                
+        except asyncio.CancelledError:
+            logger.info(f"Игровой цикл стола {table_id} отменен.")
+        except Exception as e:
+            logger.error(f"Критическая ошибка в матче {table_id}: {e}", exc_info=True)
+            await self.client.leave_table(table_id)
+
+    def _calculate_response_move(self, game_type: str, board_state: dict, parsed_move: Optional[dict]) -> Optional[str]:
+        """Маршрутизация к правильному математическому движку в зависимости от типа игры"""
+        game_lower = game_type.lower()
+        
+        # 1. Шахматы (Stockfish)
+        if "chess" in game_lower or "шахматы" in game_lower:
+            fen = board_state.get("fen", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+            return self.engines.get_chess_move(fen)
+            
+        # 2. Быки и коровы (Алгоритм Кнута)
+        elif "bulls" in game_lower or "быки" in game_lower:
+            history = board_state.get("history", [])
+            return self.engines.get_bulls_cows_move(history)
+            
+        # 3. Морской бой (Probability Grid)
+        elif "sea" in game_lower or "морской" in game_lower:
+            my_board = board_state.get("my_board", [])
+            shots = board_state.get("shots", [])
+            return self.engines.get_sea_battle_move(my_board, shots)
+            
+        # 4. Шашки / Реверси / Гомоку (Минимакс)
+        elif any(g in game_lower for g in ["checkers", "shashki", "шашки", "reversi", "gomoku"]):
+            board = board_state.get("board", [])
+            return self.engines.get_minimax_move(game_type, board)
+            
+        logger.warning(f"Движок для игры '{game_type}' не найден!")
+        return None
