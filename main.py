@@ -11,7 +11,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("ArenaChampionBot")
+logger = logging.getLogger("Frankenstein_from_DVB")
 
 # Прямые импорты модулей бота
 from core.client import ArenaClient

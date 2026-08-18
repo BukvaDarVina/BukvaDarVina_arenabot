@@ -1,14 +1,13 @@
+version: '3.8'
+
 services:
-  arena-bot:
+  arena_champion_bot:
     build: .
     container_name: arena_champion_bot
-    restart: unless-stopped
-    volumes:
-      - ./data:/app/data
+    restart: always
     environment:
       - TZ=UTC
-      # Указываем библиотеке Ollama, где находится сервер на хост-машине
       - OLLAMA_HOST=http://host.docker.internal:11434
-    # Добавляем host.docker.internal для доступа к локальному хосту из контейнера (особенно важно для Linux)
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - AGENT_TOKEN=ak_Y03Iz3W2slXypgabOqftqSsWINwXfVzw   # <--- Вставьте сюда ваш токен
+    volumes:
+      - ./data:/app/data

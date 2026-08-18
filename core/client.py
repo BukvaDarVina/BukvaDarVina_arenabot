@@ -59,9 +59,9 @@ class ArenaClient:
                 logger.error(f"Ошибка сети при запросе документа {doc}: {e}")
 
     async def register_agent(self, agent_name: str = "ArenaChampionBot") -> bool:
-        """Регистрация агента с авто-генерацией уникального имени при конфликте 409"""
+        """Если токен уже задан, пропускаем регистрацию"""
         if self.token and str(self.token).startswith("ak_"):
-            logger.info("Используется уже имеющийся валидный токен авторизации.")
+            logger.info(f"Используется захардкоженный токен: {self.token[:10]}...")
             return True
 
         base_name = agent_name
