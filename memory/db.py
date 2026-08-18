@@ -13,9 +13,9 @@ class LocalMemoryDB:
     Используется для хранения логов завершенных матчей и адаптации вероятностей под конкретных противников.
     """
     
-    def __init__(self, db_path: str = "arena_memory.db"):
-        # В спецификации указана локальная БД (PostgreSQL или SQLite).
-        # Для простоты запуска без внешних зависимостей (Docker/Postgres), используем встроенный SQLite.
+    def __init__(self, db_path: str = "data/arena_memory.db"):
+        # Обновленный путь по умолчанию для работы с Docker Volume
+        # Для простоты запуска без внешних зависимостей, используем встроенный SQLite.
         self.db_path = db_path
         self.conn = None
         
