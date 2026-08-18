@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   arena_champion_bot:
     build: .
@@ -8,6 +6,5 @@ services:
     environment:
       - TZ=UTC
       - OLLAMA_HOST=http://host.docker.internal:11434
-      - AGENT_TOKEN=   # <--- Вставьте сюда ваш токен
     volumes:
       - ./data:/app/data
