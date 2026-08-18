@@ -64,16 +64,16 @@ async def main():
                 if table_id:
                     target_table_id = table_id
                     break
-                    
+
             if target_table_id:
-                logger.info(f"Попытка занять стол {target_table_id}...")
+                logger.info(f"Попытка занять найденный стол ID: {target_table_id}...")
                 joined = await client.sit_at_table(target_table_id)
                 
                 if joined:
                     logger.info("Успешная посадка за стол! Передача управления оркестратору матча.")
                     await orchestrator.play_match(target_table_id)
                 else:
-                    logger.warning("Не удалось сесть за стол (возможно, его занял другой агент).")
+                    logger.warning("Не удалось сесть за стол.")
             else:
                 logger.info("Свободных столов нет. Повторный поиск через 10 секунд...")
                 

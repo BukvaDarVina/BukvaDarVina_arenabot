@@ -1,5 +1,6 @@
 import logging
 import httpx
+import re
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("ArenaClient")
@@ -27,27 +28,44 @@ class ArenaClient:
                 logger.error(f"Ошибка сети при запросе документа {doc}: {e}")
 
     async def get_open_tables(self) -> List[Dict[str, Any]]:
-        """Получает актуальный список открытых столов из лобби Арены"""
+        """Получает актуальный список открытых столов с главной страницы Арены (HTML парсинг)"""
         try:
-            # Запрос к основному эндпоинту лобби или главной странице/API
             response = await self.client.get("/")
             if response.status_code == 200:
-                # Платформа может возвращать JSON или HTML. Попробуем распарсить JSON, 
-                # если это API, либо возвратить данные для дальнейшей обработки парсером лобби.
+                html_content = response.text
+                tables = []
+                
+                # Пробуем сначала на случай, если это все-таки JSON API
                 try:
                     data = response.json()
-                    return data.get("tables", data.get("open_tables", []))
+                    if isinstance(data, dict):
+                        return data.get("tables", data.get("open_tables", []))
                 except Exception:
-                    logger.info("Главная страница возвращена в HTML-формате. Используем fallback-структуру или парсер лобби.")
-                    # Если Арена отдает HTML главной страницы с открытыми столами, 
-                    # здесь в будущем можно подключить Regex для поиска столов с Robik.
-                    # Пока возвращаем пустой список, чтобы оркестратор обработал это штатно.
-                    return []
+                    pass
+                    
+                # Если это HTML, ищем ссылки на матчи или столы с помощью Regex
+                # Например, ссылки вида /m/XXXXX или столы из секции "Open tables"
+                # Шаг 1: Ищем все упоминания столов или ID матчей на странице
+                match_links = re.findall(r'href=["\'](?:/m/|/api/tables/)([\w\-_]+)["\']', html_content)
+                
+                # Также поищем имена противников или названия игр рядом со ссылками
+                for table_id in set(match_links):
+                    tables.append({
+                        "id": table_id,
+                        "opponent_name": "Robik", # По умолчанию считаем противником бота станции
+                        "is_rated": False
+                    })
+                    
+                # Если регулярное выражение ничего не нашло в HTML, вернем тестовый дефолтный стол для отладки
+                if not tables and "Open tables" in html_content:
+                    logger.info("Обнаружена секция открытых столов в HTML, но ID не извлечены. Проверьте разметку.")
+                    
+                return tables
             else:
                 logger.warning(f"Не удалось получить список столов. Статус: {response.status_code}")
         except httpx.RequestError as e:
             logger.error(f"Ошибка сети при запросе лобби: {e}")
-            
+        
         return []
         
     async def sit_at_table(self, table_id: str) -> bool:
