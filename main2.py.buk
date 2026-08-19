@@ -1,0 +1,86 @@
+import asyncio
+import logging
+import os
+from core.client import ArenaClient
+from core.orchestrator import LLMOrchestrator
+from engines.manager import EngineManager
+from memory.db import LocalMemoryDB
+from parsers.translator import GameStateTranslator
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("Frank_by_DVB")
+
+async def main():
+    base_url = os.getenv("ARENA_URL", "https://arena.roomcomm.xyz")
+    token = os.getenv("ARENA_TOKEN")
+    
+    logger.info("Запуск Arena Champion Bot (Финальная Архитектура)...")
+    
+    client = ArenaClient(base_url)
+    if token:
+        client.token = token
+        
+    db = LocalMemoryDB("data/arena_memory.db")
+    await db.connect()
+    
+    engines = EngineManager()
+    translator = GameStateTranslator()
+    orchestrator = LLMOrchestrator(client, engines, db, translator)
+    
+    active_matches = set()
+    
+    logger.info("Бот запущен и перешел в режим непрерывного мониторинга арены...")
+
+    try:
+        while True:
+            try:
+                # 1. Проверяем, не находимся ли мы уже за активным столом
+                current_table = await client.get_current_seated_table()
+                if current_table and current_table not in active_matches:
+                    logger.info(f"Возврат в активный матч на столе {current_table}...")
+                    asyncio.create_task(orchestrator.play_match(current_table))
+                    active_matches.add(current_table)
+                
+                # 2. Если свободных столов мало, ищем открытый или создаем новый
+                if len(active_matches) < 4:
+                    open_tables = await client.get_open_tables()
+                    joined = False
+                    
+                    for table in open_tables:
+                        t_id = table.get("id") or table.get("table_id")
+                        if t_id and t_id not in active_matches:
+                            logger.info(f"Присоединяемся к открытому столу {t_id}...")
+                            if await client.sit_at_table(t_id):
+                                asyncio.create_task(orchestrator.play_match(t_id))
+                                active_matches.add(t_id)
+                                joined = True
+                                break
+                                
+                    # Если открытых нет — создаем свой собственный стол для случайной игры
+                    if not joined and len(active_matches) < 1:
+                        new_table_id = await client.create_table()
+                        if new_table_id and new_table_id not in active_matches:
+                            logger.info(f"Создан новый собственный стол: {new_table_id}")
+                            asyncio.create_task(orchestrator.play_match(new_table_id))
+                            active_matches.add(new_table_id)
+                            
+            except Exception as e:
+                logger.error(f"Ошибка в главном цикле мониторинга: {e}", exc_info=True)
+                
+            # Проверяем каждые 5 секунд
+            await asyncio.sleep(5)
+            
+    except asyncio.CancelledError:
+        logger.info("Главный цикл бота был остановлен.")
+    finally:
+        await client.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот выключен пользователем.")

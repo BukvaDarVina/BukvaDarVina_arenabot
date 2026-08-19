@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import httpx
 import re
 import os
@@ -116,71 +117,87 @@ class ArenaClient:
         return False
 
     async def get_open_tables(self) -> List[Dict[str, Any]]:
+        """Универсальный сборщик открытых столов из лобби"""
         try:
-            response = await self.client.get("/", headers=self._get_auth_headers())
-            if response.status_code == 200:
-                html_content = response.text
-                tables = []
-                if "Open tables" in html_content:
-                    parts = html_content.split("Open tables")
-                    section = parts[1].split("Playing now")[0] if "Playing now" in parts[1] else parts[1]
-                    match_links = re.findall(r'href=["\'](?:/m/|/api/tables/|/table/|/game/)([\w\-_]+)["\']', section)
-                    for table_id in set(match_links):
-                        if table_id not in ["leaderboard", "games", "agents", "api", "login", "register"]:
-                            tables.append({"id": table_id, "is_rated": False})
-                return tables
-        except Exception as e:
-            logger.error(f"Ошибка при запросе лобби: {e}")
+            # Пробуем запросить корневую страницу или специальный API лобби
+            for path in ["/", "/api/tables", "/api/lobbies"]:
+                response = await self.client.get(path)
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        # Извлекаем список из возможных ключей
+                        tables = data.get("tables", data.get("open_tables", data.get("lobbies", [])))
+                        if tables:
+                            return tables
+                    except Exception:
+                        pass
+        except httpx.RequestError as e:
+            logger.error(f"Ошибка сети при запросе лобби: {e}")
         return []
 
-    async def create_table(self, game_type: Optional[str] = None) -> Optional[str]:
-        """Создает стол для случайной игры из каталога Арены или для конкретной, если указано"""
+    async def create_table(self, game_type: str = "chess") -> Optional[str]:
+        """Создает новый открытый стол с защитой от лимитов (429)"""
         try:
             headers = self._get_auth_headers()
             
+            # 1. Сначала проверяем, не сидим ли мы уже за столом, чтобы не плодить запросы
             seated = await self.get_current_seated_table()
             if seated:
+                logger.info(f"Обнаружен активный стол, продолжаем игру на нем: {seated}")
                 return seated
 
-            # Если игра не передана явно, берем рандом из каталога /api/games
-            if not game_type:
-                try:
-                    games_resp = await self.client.get("/api/games", headers=headers)
-                    if games_resp.status_code == 200:
-                        data = games_resp.json()
-                        games_list = data.get("games", [])
-                        if games_list:
-                            import random
-                            chosen_game = random.choice(games_list)
-                            # Каждая игра в ответе имеет поле "id" (например, "chess", "bulls", "seabattle", "artillery")
-                            game_type = chosen_game.get("id") or chosen_game.get("name")
-                except Exception as e:
-                    logger.warning(f"Не удалось получить список игр, фоллбек на шахматы: {e}")
-
-            # Если по какой-то причине список недоступен, фоллбек на chess
-            game_type = game_type or "chess"
-            payload = {"game": str(game_type).lower()}
-            
-            logger.info(f"Создаем новый стол для случайной игры: '{payload['game']}'...")
+            # 2. Создаем стол
+            payload = {"game": game_type.lower()}
+            logger.info(f"Попытка создания стола для игры: '{payload['game']}'...")
             
             response = await self.client.post("/api/tables", json=payload, headers=headers)
+            
             if response.status_code in (200, 201):
                 data = response.json()
-                return data.get("id") or data.get("table_id") or data.get("match") or data.get("match_id")
+                table_id = data.get("id") or data.get("table_id") or data.get("match") or data.get("table")
+                logger.info(f"Успешно создан новый стол с ID: {table_id}")
+                return table_id
+                
+            elif response.status_code == 429:
+                logger.warning("Превышен лимит запросов (429 Too Many Requests). Спим 30 секунд перед повторной попыткой...")
+                await asyncio.sleep(30)
+                return None
+                
             elif response.status_code == 409:
-                match = re.search(r'match\s+([A-Z0-9]+)', response.text)
+                error_text = response.text
+                match = re.search(r'match\s+([A-Z0-9]+)', error_text)
                 if match:
-                    return match.group(1)
+                    table_id = match.group(1)
+                    logger.info(f"Бот уже находится за активным столом: {table_id}")
+                    return table_id
+                logger.warning(f"Конфликт создания стола: {error_text}")
+            else:
+                logger.warning(f"Не удалось создать стол. Статус: {response.status_code} - {response.text}")
         except Exception as e:
             logger.error(f"Ошибка при создании стола: {e}")
+            
         return None
 
     async def sit_at_table(self, table_id: str) -> bool:
-        try:
-            response = await self.client.post(f"/api/tables/{table_id}/join", headers=self._get_auth_headers())
-            return response.status_code in (200, 201)
-        except Exception:
-            return False
+        """Пробует все возможные варианты эндпоинтов для присоединения к столу"""
+        endpoints = [
+            f"/api/tables/{table_id}/join",
+            f"/api/matches/{table_id}/join",
+            f"/api/tables/{table_id}/sit",
+            f"/api/tables/{table_id}"
+        ]
+        
+        headers = self._get_auth_headers()
+        for url in endpoints:
+            try:
+                response = await self.client.post(url, headers=headers)
+                if response.status_code in (200, 201):
+                    logger.info(f"Успешно сели за стол {table_id} через {url}")
+                    return True
+            except Exception:
+                continue
+                
+        return False
             
     async def get_match_state(self, table_id: str) -> Optional[Dict[str, Any]]:
         """Получает состояние матча и разворачивает вложенный ключ 'state', если он есть"""
@@ -254,54 +271,57 @@ class ArenaClient:
         await self.client.aclose()
 
     async def generate_chat_comment(self, game_name: str, last_move: str, my_role: str) -> str:
-        """Генерирует осмысленную реплику через локальную Ollama"""
-        import httpx
-        ollama_url = "http://host.docker.internal:11434/api/generate" # Или ваш адрес Ollama
-        
+        """Генерирует реплику через Ollama или использует встроенный трешток"""
+        ollama_url = "http://host.docker.internal:11434/api/generate"
         prompt = (
             f"Ты играешь в игру '{game_name}' на игровой арене. "
-            f"Соперник только что сделал ход: '{last_move}'. Твоя роль: {my_role}. "
+            f"Соперник только что сделал ход: '{last_move}'. "
             f"Напиши короткую, дерзкую или остроумную реплику на русском языке для чата с противником. "
             f"Не пиши ничего, кроме самой фразы, максимум 1-2 предложения."
         )
-        
         payload = {
-            "model": "llama3", # Или ваша модель, например "mistral" или "phi3"
+            "model": "llama3",
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0.7}
         }
         
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(ollama_url, json=payload)
+            async with httpx.AsyncClient(timeout=3.0) as ollama_client:
+                resp = await ollama_client.post(ollama_url, json=payload)
                 if resp.status_code == 200:
                     data = resp.json()
-                    return data.get("response", "").strip('" \n')
-        except Exception as e:
-            logger.debug(f"Ollama недоступна для чата: {e}")
+                    text = data.get("response", "").strip('" \n')
+                    if text:
+                        return text
+        except Exception:
+            pass
             
-        # Запасные фразы, если Ollama молчит
+        # Запасные фразы на случай, если Ollama не запущена
         fallbacks = [
-            "Интересный ход, но я просчитал его на 5 шагов вперед.",
-            "Хм, дерзко. Посмотрим, что ты сделаешь дальше.",
-            "Машина думает... хотя победа уже за мной.",
-            "Неплохо, неплохо!"
+            "Интересный ход, но я просчитал партию на несколько шагов вперед.",
+            "Хм, дерзко. Посмотрим, что ты сделаешь в следующем кону.",
+            "Мои математические движки работают быстрее, чем твои раздумья.",
+            "Неплохо, но победа все равно останется за мной!"
         ]
-        import random
         return random.choice(fallbacks)
 
     async def send_chat_message(self, table_id: str, message: str) -> bool:
-        """Отправляет реплику в чат текущего матча"""
-        headers = self._get_auth_headers()
-        chat_url = f"/api/matches/{table_id}/chat"
-        payload = {"message": message}
+        """Отправляет сообщение в чат матча по возможным эндпоинтам"""
+        endpoints = [
+            f"/api/matches/{table_id}/chat",
+            f"/api/tables/{table_id}/chat",
+            f"/api/matches/{table_id}/message",
+            f"/api/tables/{table_id}/message"
+        ]
         
-        try:
-            response = await self.client.post(chat_url, json=payload, headers=headers)
-            if response.status_code in (200, 201):
-                logger.info(f"💬 Сказали в чат: '{message}'")
-                return True
-        except Exception as e:
-            logger.debug(f"Не удалось отправить сообщение в чат: {e}")
+        for url in endpoints:
+            try:
+                response = await self.client.post(url, json={"message": message})
+                if response.status_code in (200, 201):
+                    logger.info(f"💬 Отправлено в чат [{table_id}]: '{message}'")
+                    return True
+            except Exception:
+                continue
+                
         return False

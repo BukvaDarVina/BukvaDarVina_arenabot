@@ -17,7 +17,7 @@ class LLMOrchestrator:
     async def play_match(self, table_id: str) -> None:
         logger.info(f"Запуск игрового цикла за столом {table_id}...")
         
-        last_sent_move_count = -1
+        last_action_key = None  # Защита от повторной отправки хода на том же под-шаге
         game_type = "Chess"
         last_state_change_time = time.time()
         
@@ -47,6 +47,8 @@ class LLMOrchestrator:
                     continue
 
                 game_type = state.get("game_type", state.get("game", game_type))
+                game_lower = game_type.lower()
+                
                 moves_history = state.get("moves", [])
                 current_moves_len = len(moves_history)
                 
@@ -58,10 +60,65 @@ class LLMOrchestrator:
                     await self.client.leave_table(table_id)
                     break
 
+                # --- УМНОЕ ОПРЕДЕЛЕНИЕ ОЧЕРЕДИ ДЛЯ ВСЕХ ТИПОВ ИГР ---
+                # --- АБСОЛЮТНО НАДЕЖНОЕ ОПРЕДЕЛЕНИЕ ОЧЕРЕДИ ---
+                # --- УМНОЕ И ТОЧНОЕ ОПРЕДЕЛЕНИЕ ОЧЕРЕДИ ---
                 is_my_turn = state.get("yourTurn", False)
                 
-                if current_moves_len != last_sent_move_count:
-                    last_sent_move_count = -1
+                your_color = state.get("your_color") or state.get("color")
+                to_move = state.get("to_move") or state.get("turn")
+                
+                # Если бэкенд явно говорит, что сейчас ход нашего цвета (например, "black" == "black" или "w" == "w")
+                if your_color and to_move and str(your_color).lower() == str(to_move).lower():
+                    is_my_turn = True
+                
+                # Дополнительные проверки для специфических игр, если is_my_turn всё еще False:
+                if not is_my_turn:
+                    if "pact" in game_lower:
+                        phase = state.get("phase")
+                        if phase == "promise" and not state.get("promised", False):
+                            is_my_turn = True
+                        elif phase == "move" and not state.get("moved", False):
+                            is_my_turn = True
+                    elif "rps" in game_lower or "rock" in game_lower:
+                        if not state.get("myMatch", {}).get("thrown", False):
+                            is_my_turn = True
+                    elif "karateka" in game_lower:
+                        if state.get("phase") == "pick" and not state.get("picked", False):
+                            is_my_turn = True
+                    elif "onewave" in game_lower:
+                        if not state.get("picked", False):
+                            is_my_turn = True
+                    elif "three" in game_lower or "fronts" in game_lower:
+                        if not state.get("submitted", False):
+                            is_my_turn = True
+                    elif "bulls" in game_lower:
+                        if state.get("phase") == "setup" and not state.get("mySecret"):
+                            is_my_turn = True
+                    elif "durak" in game_lower:
+                        role = state.get("role")
+                        table = state.get("table", [])
+                        has_unbeaten = any(bout.get("d") is None for bout in table)
+                        if role == "defender" and has_unbeaten:
+                            is_my_turn = True
+                        elif role == "attacker" and state.get("canAttack", False):
+                            is_my_turn = True
+
+                # Формируем уникальный ключ текущего состояния действия (учитывает раунд, фазу и флаги отправки)
+                current_action_key = (
+                    current_moves_len,
+                    state.get("round"),
+                    state.get("phase"),
+                    str(state.get("board", [])),               # Состояние доски (меняется при каждом ходе в шашках/шахматах)
+                    state.get("to_move") or state.get("turn"), # Чей ход
+                    str(state.get("legal_moves", [])),         # Список легальных ходов
+                    tuple(state.get("hand", [])),
+                    str(state.get("table", [])),
+                    state.get("promised"),
+                    state.get("moved"),
+                    state.get("picked"),
+                    state.get("submitted")
+                )
 
                 # Фоновая генерация реплик через Ollama при появлении новых ходов
                 if current_moves_len > 0 and current_moves_len != self._last_seen_moves_len:
@@ -76,8 +133,8 @@ class LLMOrchestrator:
                     
                     asyncio.create_task(speak())
 
-                if is_my_turn and last_sent_move_count != current_moves_len:
-                    logger.info(f"Очередь нашего хода! Ходов в истории: {current_moves_len}")
+                if is_my_turn and current_action_key != last_action_key:
+                    logger.info(f"Очередь нашего хода! Состояние: phase={state.get('phase')}, round={state.get('round')}")
                     
                     parsed_move = None
                     if current_moves_len > 0:
@@ -93,7 +150,7 @@ class LLMOrchestrator:
                         success = await self.client.send_move(table_id, bot_move)
                         if success:
                             logger.info("Ход успешно отправлен.")
-                            last_sent_move_count = current_moves_len
+                            last_action_key = current_action_key
                             last_state_change_time = time.time()
                             await asyncio.sleep(3)
                         else:
@@ -177,8 +234,14 @@ class LLMOrchestrator:
         elif any(g in game_lower for g in ["checkers", "shashki", "reversi"]):
             if legal_moves:
                 return random.choice(legal_moves)
+            
             if "reversi" in game_lower:
                 return {"type": "pass"}
+            
+            # ВНИМАНИЕ ДЛЯ ШАШЕК: В шашках нельзя делать pass! 
+            # Если legal_moves пусты, но сервер ждет ход, отправляем безопасную заглушку или заставляем движок перепроверить доску
+            logger.warning("⚠️ В шашках пустой список legal_moves! Пытаемся отправить базовый шаг вместо pass.")
+            return {"type": "move", "path": ["b6", "a5"]}
 
         # 5. Пятнашки
         elif "fifteen" in game_lower:
@@ -257,39 +320,36 @@ class LLMOrchestrator:
 
             return {"type": "done"}
 
-        # Правило (The Rule)
+        # 9. Остальные игры (The Pact, The Rule, etc.)
+        elif "pact" in game_lower:
+            phase = board_state.get("phase", "promise")
+            promised = board_state.get("promised", False)
+            moved = board_state.get("moved", False)
+            if phase == "promise" and not promised:
+                return {"type": "promise", "p": random.choice(["cooperate", "betray"])}
+            elif phase == "move" and not moved:
+                return {"type": "move", "m": random.choice(["c", "d"])}
+            return {"type": "pass"}
+
         elif "rule" in game_lower:
             phase = board_state.get("phase")
             role = board_state.get("role")
             rules_list = board_state.get("rules", [{"id": "even"}])
-            
             if role == "picker" and phase == "choose":
-                # Если мы загадываем правило, выбираем первое попавшееся из списка
                 return {"type": "choose_rule", "rule": rules_list[0].get("id", "even")}
-                
             elif phase == "probe":
                 if role == "guesser":
                     probes_left = board_state.get("probesLeft", 10)
-                    
-                    # ВАЖНО: Если попытки пробы исчерпаны (probesLeft == 0), 
-                    # мы обязаны сделать финальную догадку (guess), иначе игра зависнет!
                     if probes_left <= 0:
-                        # Выбираем случайное правило из доступного открытого списка правил
                         chosen_rule_id = random.choice(rules_list).get("id", "even")
-                        logger.info(f"попытки закончились. Делаем финальный guess правила: {chosen_rule_id}")
                         return {"type": "guess", "rule": chosen_rule_id}
                     else:
-                        # Иначе продолжаем зондировать случайным числом от 1 до 100
                         return {"type": "probe", "n": random.randint(1, 100)}
                 else:
-                    # Если мы picker в фазе probe, мы просто ждем ходов соперника
                     return {"type": "pass"}
             else:
-                # Фоллбек-догадка
-                fallback_rule = rules_list[0].get("id", "even")
-                return {"type": "guess", "rule": fallback_rule}
+                return {"type": "guess", "rule": rules_list[0].get("id", "even")}
 
-        # 9. Остальные игры / Универсальный Fallback
         elif "mind" in game_lower:
             return {"type": "play"}
         elif "onewave" in game_lower or "wave" in game_lower:
@@ -297,17 +357,36 @@ class LLMOrchestrator:
             return {"type": "pick", "v": random.choice(options)}
         elif "karateka" in game_lower:
             return {"type": "act", "a": random.choice(["strike", "grab", "block"])}
-        elif "pact" in game_lower:
-            if board_state.get("phase") == "promise":
-                return {"type": "promise", "p": random.choice(["cooperate", "betray", "alternate"])}
-            return {"type": "move", "m": random.choice(["c", "d"])}
         elif "gomoku" in game_lower or "five" in game_lower:
             return {"type": "move", "r": random.randint(0, 14), "c": random.randint(0, 14)}
         elif "dots" in game_lower or "boxes" in game_lower:
             n = board_state.get("n", 4)
             return {"type": "edge", "kind": random.choice(["h", "v"]), "r": random.randint(0, n-1), "c": random.randint(0, n-1)}
         elif "tank" in game_lower:
-            return {"type": "move", "dx": random.choice([-1, 1]), "dy": random.choice([-1, 0, 1])}
+            legal_moves = board_state.get("legal_moves", [])
+            if legal_moves:
+                chosen = random.choice(legal_moves)
+                if isinstance(chosen, dict) and "type" not in chosen:
+                    chosen["type"] = "move"
+                return chosen
+            
+            n = board_state.get("n", 7)
+            me = board_state.get("me") or {"x": 0, "y": 0}
+            
+            # Шаг в случайную сторону
+            dx, dy = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
+            nx = max(0, min(n - 1, me.get("x", 0) + dx))
+            ny = max(0, min(n - 1, me.get("y", 0) + dy))
+            
+            # Если уже стреляли в этот ход (shotThisTurn), то только двигаемся
+            if board_state.get("shotThisTurn", False):
+                return {"type": "move", "x": nx, "y": ny}
+            
+            # Иначе с вероятностью 50% стреляем по случайным координатам или двигаемся
+            if random.random() < 0.5:
+                return {"type": "fire", "x": random.randint(0, n - 1), "y": random.randint(0, n - 1)}
+            else:
+                return {"type": "move", "x": nx, "y": ny}
         elif "three" in game_lower or "fronts" in game_lower:
             return {"type": "split", "a": 4, "b": 4, "c": 5}
 
