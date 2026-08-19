@@ -133,27 +133,42 @@ class ArenaClient:
             logger.error(f"Ошибка при запросе лобби: {e}")
         return []
 
-    async def create_table(self, game_type: str = "chess") -> Optional[str]:
+    async def create_table(self, game_type: Optional[str] = None) -> Optional[str]:
+        """Создает стол для указанной игры, а если не указана — берет случайную!"""
         try:
             headers = self._get_auth_headers()
             
-            # Проверяем список доступных игр
-            games_resp = await self.client.get("/api/games", headers=headers)
-            if games_resp.status_code == 200:
-                games_data = games_resp.json()
-                if isinstance(games_data, list) and games_data:
-                    game_type = games_data[0].get("name", game_type).lower()
-                elif isinstance(games_data, dict) and "games" in games_data:
-                    available = games_data["games"]
-                    if available:
-                        game_type = available[0].lower() if isinstance(available[0], str) else available[0].get("name", "chess").lower()
+            seated = await self.get_current_seated_table()
+            if seated:
+                return seated
+
+            # Если игру не передали жестко, запрашиваем список у платформы и берем любую
+            if not game_type:
+                games_resp = await self.client.get("/api/games", headers=headers)
+                if games_resp.status_code == 200:
+                    games_data = games_resp.json()
+                    if isinstance(games_data, list) and games_data:
+                        import random
+                        # Берем случайную игру из списка доступных!
+                        game_info = random.choice(games_data)
+                        game_type = game_info.get("name", "chess").lower()
+                    elif isinstance(games_data, dict) and "games" in games_data:
+                        available = games_data["games"]
+                        if available:
+                            import random
+                            chosen = random.choice(available)
+                            game_type = chosen.lower() if isinstance(chosen, str) else chosen.get("name", "chess").lower()
             
+            # Если Апи недоступно, фоллбек на шахматы
+            game_type = game_type or "chess"
+
             payload = {"game": game_type.lower()}
+            logger.info(f"Случайный выбор! Создаем стол для игры: '{payload['game']}'...")
+            
             response = await self.client.post("/api/tables", json=payload, headers=headers)
             if response.status_code in (200, 201):
                 data = response.json()
-                table_id = data.get("id") or data.get("table_id") or data.get("match") or data.get("match_id")
-                return table_id
+                return data.get("id") or data.get("table_id") or data.get("match") or data.get("match_id")
             elif response.status_code == 409:
                 match = re.search(r'match\s+([A-Z0-9]+)', response.text)
                 if match:
@@ -170,7 +185,7 @@ class ArenaClient:
             return False
             
     async def get_match_state(self, table_id: str) -> Optional[Dict[str, Any]]:
-        """Получает состояние матча, пробуя разные эндпоинты платформы"""
+        """Получает состояние матча и разворачивает вложенный ключ 'state', если он есть"""
         headers = self._get_auth_headers()
         last_response = None
         
@@ -178,7 +193,8 @@ class ArenaClient:
         try:
             response = await self.client.get(f"/api/tables/{table_id}", headers=headers)
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                return self._flatten_state(data)
             last_response = response
         except Exception:
             pass
@@ -187,23 +203,53 @@ class ArenaClient:
         try:
             response = await self.client.get(f"/api/matches/{table_id}", headers=headers)
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                return self._flatten_state(data)
             last_response = response
         except Exception:
             pass
             
-        # 3. Если получили 404 — мы сидим за столом и ждем соперника
         if last_response is not None and last_response.status_code == 404:
             return {"status": "waiting_for_opponent", "is_finished": False}
             
         return None
 
-    async def send_move(self, table_id: str, move: str) -> bool:
+    def _flatten_state(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Разворачивает вложенный словарь state в корневой уровень"""
+        if not isinstance(data, dict):
+            return {}
+        if "state" in data and isinstance(data["state"], dict):
+            flattened = {**data}
+            # Переносим все поля из вложенного state наверх
+            flattened.update(data["state"])
+            return flattened
+        return data
+
+    async def send_move(self, table_id: str, move: Any) -> bool:
+        """Отправляет ход на сервер в чистом виде, без лишних оберток"""
+        headers = self._get_auth_headers()
+        match_url = f"/api/matches/{table_id}/move"
+        
+        # Если движок уже вернул словарь (например, {'type': 'move', 'from': 'e2', 'to': 'e4'}),
+        # мы отправляем его НАПРЯМУЮ, как есть!
+        # Если это строка (например, 'e2e4'), оборачиваем в стандартный формат.
+        if isinstance(move, dict):
+            payload = move
+        else:
+            payload = {"type": "move", "move": move}
+            
         try:
-            payload = {"move": move}
-            response = await self.client.post(f"/api/tables/{table_id}/move", json=payload, headers=self._get_auth_headers())
-            return response.status_code in (200, 201)
-        except Exception:
+            logger.info(f"Отправка хода на {match_url} с payload: {payload}")
+            response = await self.client.post(match_url, json=payload, headers=headers)
+            
+            if response.status_code in (200, 201):
+                logger.info(f"Ответ сервера на ход: {response.text}")
+                return True
+            else:
+                logger.warning(f"Сервер отклонил ход! Статус: {response.status_code}, Ответ: {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Ошибка сети при отправке хода: {e}")
             return False
         
     async def close(self) -> None:

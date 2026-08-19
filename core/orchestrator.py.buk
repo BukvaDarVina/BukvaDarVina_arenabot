@@ -19,12 +19,11 @@ class LLMOrchestrator:
     async def play_match(self, table_id: str) -> None:
         logger.info(f"Запуск игрового цикла за столом {table_id}...")
         
-        last_processed_move_index = 0
+        last_sent_move_count = -1  # Защита от повторной отправки хода на том же ходу
         game_type = "Chess"
         last_state_change_time = time.time()
         
-        # Получим имя нашего бота через /api/keys/me (чтобы точно знать, как мы записаны в матче)
-        my_agent_name = "Frank_by_DVB" # Дефолтное значение
+        my_agent_name = "Frank_by_DVB"
         try:
             me_resp = await self.client.client.get("/api/keys/me", headers=self.client._get_auth_headers())
             if me_resp.status_code == 200:
@@ -40,7 +39,8 @@ class LLMOrchestrator:
                     await asyncio.sleep(3)
                     continue
                     
-                if state.get("status") == "waiting_for_opponent":
+                status = state.get("status")
+                if status == "waiting_for_opponent":
                     if time.time() - last_state_change_time > 300:
                         logger.warning(f"Таймаут: Никто не присоединился к столу {table_id} за 5 минут.")
                         await self.client.leave_table(table_id)
@@ -48,11 +48,12 @@ class LLMOrchestrator:
                     await asyncio.sleep(5)
                     continue
 
+                # ИГРА ИДЕТ
                 game_type = state.get("game_type", state.get("game", game_type))
                 moves_history = state.get("moves", [])
+                current_moves_len = len(moves_history)
                 
-                # 1. Проверка завершения
-                if state.get("is_finished", False) or state.get("status") in ["finished", "aborted", "abandoned"]:
+                if state.get("is_finished", False) or status in ["finished", "aborted", "abandoned"]:
                     winner = state.get("winner", "Unknown")
                     logger.info(f"Матч {table_id} завершен! Победитель: {winner}")
                     if hasattr(self.db, 'save_match'):
@@ -60,64 +61,48 @@ class LLMOrchestrator:
                     await self.client.leave_table(table_id)
                     break
 
-                # 2. ОПРЕДЕЛЯЕМ, ЧЬЯ СЕЙЧАС ОЧЕРЕДЬ
-                current_moves_len = len(moves_history)
-                new_moves_available = current_moves_len > last_processed_move_index
+                # --- ЖЕСТКАЯ ПРОВЕРКА ОЧЕРЕДИ ОТ СЕРВЕРА ---
+                # Платформа всегда шлет свой флаг вашей очереди в yourTurn
+                is_my_turn = state.get("yourTurn", False)
                 
-                # Ищем явное указание на очередь
-                is_my_turn = state.get("is_my_turn", False)
-                turn_agent = state.get("turn") or state.get("next_player")
-                
-                if turn_agent:
-                    # Если сервер явно говорит, чей ход — верим ему!
-                    is_my_turn = (turn_agent == my_agent_name)
-                else:
-                    # Если явного поля нет, считаем четность ходов.
-                    # По умолчанию создатель стола (мы) обычно ходит первым (index 0).
-                    # Если ходов четное количество (0, 2, 4) - наш ход. Нечетное (1, 3, 5) - противника.
-                    # ВАЖНО: Если мы подключились к чужому столу, мы ходим вторыми (нечетные индексы).
-                    # Так как пока мы только создаем столы, оставим правило "мы играем за первых".
-                    is_my_turn = (current_moves_len % 2 == 0)
+                # Если длина истории изменилась, сбрасываем защиту отправки
+                if current_moves_len != last_sent_move_count:
+                    last_sent_move_count = -1
 
-                # Логируем новые ходы противника
-                if new_moves_available:
-                    last_state_change_time = time.time()
-                    latest_move = moves_history[-1]
-                    logger.info(f"Сделан ход: '{latest_move}'")
-                    last_processed_move_index = current_moves_len
-
-                # 3. НАШ ХОД
-                if is_my_turn:
-                    # Если мы уже рассчитали ход для этой длины истории, не делаем это дважды!
-                    # Это предотвратит спам одинаковыми ходами, если сервер тупит
+                if is_my_turn and last_sent_move_count != current_moves_len:
+                    logger.info(f"Очередь нашего хода! Ходов в истории: {current_moves_len}")
                     
                     parsed_move = None
                     if current_moves_len > 0:
-                        parsed_move = self.translator.parse_move(game_type, moves_history[-1])
+                        try:
+                            parsed_move = self.translator.parse_move(game_type, moves_history[-1])
+                        except Exception:
+                            pass
                     
                     bot_move = self._calculate_response_move(game_type, state, parsed_move)
                     
                     if bot_move:
-                        logger.info(f"Движок предложил ход: {bot_move}. Отправка на сервер...")
+                        logger.info(f"Отправляем ход на сервер: {bot_move}")
                         success = await self.client.send_move(table_id, bot_move)
                         if success:
-                            logger.info("Ход успешно принят платформой.")
-                            last_processed_move_index += 1  # Увеличиваем индекс, чтобы не слать ход дважды
+                            logger.info("Ход успешно отправлен.")
+                            last_sent_move_count = current_moves_len  # Запоминаем, что на эту длину истории мы уже сходили
                             last_state_change_time = time.time()
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(3)
                         else:
-                            logger.warning(f"Платформа отклонила ход {bot_move}. Возможно, формат неверен. Ждем 2с...")
+                            logger.warning("Сервер отклонил ход. Повтор через 2с...")
                             await asyncio.sleep(2)
                     else:
-                        logger.warning(f"Движок не смог рассчитать ход для '{game_type}'.")
-                        await asyncio.sleep(3)
+                        logger.warning("Движок не смог рассчитать ход.")
+                else:
+                    # Сейчас не наша очередь (или мы уже сделали ход на этот полуход) — просто ждем
+                    await asyncio.sleep(2)
 
+                # Таймаут зависания (никто не ходит 5 минут)
                 if time.time() - last_state_change_time > 300:
                     logger.warning(f"Таймаут: Игра на столе {table_id} зависла на 5 минут.")
                     await self.client.leave_table(table_id)
                     break
-
-                await asyncio.sleep(2)
                 
         except asyncio.CancelledError:
             logger.info(f"Игровой цикл стола {table_id} отменен.")
@@ -129,10 +114,42 @@ class LLMOrchestrator:
         """Маршрутизация к правильному математическому движку в зависимости от типа игры"""
         game_lower = game_type.lower()
         
-        # 1. Шахматы (Stockfish)
-        if "chess" in game_lower or "шахматы" in game_lower:
-            fen = board_state.get("fen", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            return self.engines.get_chess_move(fen)
+        # Шахматы
+        if "chess" in game_lower:
+            fen = board_state.get("fen")
+            legal_moves_list = board_state.get("legal_moves", [])
+            
+            logger.info(f"Текущий FEN от сервера: {fen}, Доступно легальных ходов: {len(legal_moves_list)}")
+            
+            # Если у нас есть легальные ходы от сервера, используем Stockfish для выбора лучшего из них,
+            # либо просто берем первый легальный ход (что гарантирует 100% принятие сервером).
+            if legal_moves_list:
+                # Попробуем спросить Stockfish, если есть правильный FEN
+                selected_move = None
+                if fen:
+                    try:
+                        raw_move = self.engines.get_chess_move(fen)
+                        if raw_move and len(raw_move) >= 4:
+                            f_from, f_to = raw_move[0:2], raw_move[2:4]
+                            promo = raw_move[4] if len(raw_move) == 5 else None
+                            
+                            for lm in legal_moves_list:
+                                if lm.get("from") == f_from and lm.get("to") == f_to:
+                                    if promo and lm.get("promotion") != promo:
+                                        continue
+                                    selected_move = lm
+                                    break
+                    except Exception as e:
+                        logger.error(f"Ошибка Stockfish: {e}")
+                
+                # Если Stockfish не смог выбрать или предложил что-то не то, берем первый легальный ход от сервера
+                if not selected_move:
+                    selected_move = legal_moves_list[0]
+                    logger.info(f"Берем гарант-ход из legal_moves: {selected_move}")
+                
+                if "type" not in selected_move:
+                    selected_move["type"] = "move"
+                return selected_move
             
         # 2. Быки и коровы (Алгоритм Кнута)
         elif "bulls" in game_lower or "быки" in game_lower:
