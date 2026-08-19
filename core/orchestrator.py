@@ -1,21 +1,23 @@
 import asyncio
-import logging
 import time
-from typing import Any, Optional
+import logging
+import random
+from typing import Optional, Any, Dict
 
 logger = logging.getLogger("LLMOrchestrator")
 
 class LLMOrchestrator:
-    def __init__(self, client: Any, db: Any, engines: Any, translator: Any):
+    def __init__(self, client, engines, db, translator):
         self.client = client
-        self.db = db
         self.engines = engines
+        self.db = db
         self.translator = translator
-        
+        self._last_seen_moves_len = 0
+
     async def play_match(self, table_id: str) -> None:
         logger.info(f"Запуск игрового цикла за столом {table_id}...")
         
-        last_processed_move_index = 0
+        last_sent_move_count = -1
         game_type = "Chess"
         last_state_change_time = time.time()
         
@@ -24,7 +26,6 @@ class LLMOrchestrator:
             me_resp = await self.client.client.get("/api/keys/me", headers=self.client._get_auth_headers())
             if me_resp.status_code == 200:
                 my_agent_name = me_resp.json().get("agent", my_agent_name)
-                logger.info(f"Мое имя на сервере: {my_agent_name}")
         except Exception:
             pass
 
@@ -45,9 +46,9 @@ class LLMOrchestrator:
                     await asyncio.sleep(5)
                     continue
 
-                # ИГРА ИДЕТ
                 game_type = state.get("game_type", state.get("game", game_type))
                 moves_history = state.get("moves", [])
+                current_moves_len = len(moves_history)
                 
                 if state.get("is_finished", False) or status in ["finished", "aborted", "abandoned"]:
                     winner = state.get("winner", "Unknown")
@@ -57,30 +58,26 @@ class LLMOrchestrator:
                     await self.client.leave_table(table_id)
                     break
 
-                current_moves_len = len(moves_history)
-                new_moves_available = current_moves_len > last_processed_move_index
+                is_my_turn = state.get("yourTurn", False)
                 
-                # --- УМНОЕ ОПРЕДЕЛЕНИЕ ОЧЕРЕДИ ХОДА ---
-                is_my_turn = state.get("yourTurn", state.get("your_turn", state.get("is_my_turn", False)))
-                turn_side = state.get("turn") or state.get("to_move") # Для шахмат ('w' или 'b')
-                my_color = state.get("your_color") # ('w' или 'b')
-                
-                if turn_side and my_color:
-                    is_my_turn = (turn_side == my_color)
-                
-                # Если сервер не передал флаги, страхуемся по четности длины истории
-                if not is_my_turn and current_moves_len == 0:
-                    is_my_turn = True # Мы белые и ходим первыми
+                if current_moves_len != last_sent_move_count:
+                    last_sent_move_count = -1
 
-                if new_moves_available:
-                    last_state_change_time = time.time()
+                # Фоновая генерация реплик через Ollama при появлении новых ходов
+                if current_moves_len > 0 and current_moves_len != self._last_seen_moves_len:
+                    self._last_seen_moves_len = current_moves_len
                     latest_move = moves_history[-1]
                     logger.info(f"Соперник походил: '{latest_move}'. Всего ходов в партии: {current_moves_len}")
-                    last_processed_move_index = current_moves_len
+                    
+                    async def speak():
+                        comment = await self.client.generate_chat_comment(game_type, str(latest_move), "игрок")
+                        if comment:
+                            await self.client.send_chat_message(table_id, comment)
+                    
+                    asyncio.create_task(speak())
 
-                # --- ДЕЛАЕМ ХОД, ЕСЛИ СЕЙЧАС НАША ОЧЕРЕДЬ ---
-                if is_my_turn:
-                    logger.info(f"Наш ход! Рассчитываем позицию (всего ходов: {current_moves_len})...")
+                if is_my_turn and last_sent_move_count != current_moves_len:
+                    logger.info(f"Очередь нашего хода! Ходов в истории: {current_moves_len}")
                     
                     parsed_move = None
                     if current_moves_len > 0:
@@ -92,26 +89,23 @@ class LLMOrchestrator:
                     bot_move = self._calculate_response_move(game_type, state, parsed_move)
                     
                     if bot_move:
-                        logger.info(f"Движок выдал ход: {bot_move}. Отправляем на сервер...")
+                        logger.info(f"Отправляем ход на сервер: {bot_move}")
                         success = await self.client.send_move(table_id, bot_move)
                         if success:
-                            logger.info("Успех! Ход принят платформой.")
+                            logger.info("Ход успешно отправлен.")
+                            last_sent_move_count = current_moves_len
                             last_state_change_time = time.time()
-                            # Даем паузу, чтобы сервер успел обновить состояние доски
                             await asyncio.sleep(3)
-                            continue
                         else:
-                            logger.warning("Платформа отклонила ход. Повтор через 2с...")
+                            logger.warning("Сервер отклонил ход. Повтор через 2с...")
                             await asyncio.sleep(2)
                     else:
                         logger.warning("Движок не смог рассчитать ход.")
                 else:
-                    # Не наша очередь — просто ждем соперника
                     await asyncio.sleep(2)
 
-                # Таймаут зависания (никто не ходит)
                 if time.time() - last_state_change_time > 300:
-                    logger.warning(f"Таймаут: Игра на столе {table_id} зависла на 5 минут без новых ходов.")
+                    logger.warning(f"Таймаут: Игра на столе {table_id} зависла на 5 минут.")
                     await self.client.leave_table(table_id)
                     break
                 
@@ -120,41 +114,51 @@ class LLMOrchestrator:
         except Exception as e:
             logger.error(f"Критическая ошибка в матче {table_id}: {e}", exc_info=True)
             await self.client.leave_table(table_id)
+
     def _calculate_response_move(self, game_type: str, board_state: dict, parsed_move: Optional[dict]) -> Any:
-        """Абсолютно всеядный маршрутизатор. Знает спецификации JSON для всех игр на Арене."""
         game_lower = game_type.lower()
-        import random
-        
-        # Получаем легальные ходы (Платформа отдает их для Chess, Shashki, Reversi)
         legal_moves = board_state.get("legal_moves", [])
-
-        # ==========================================
-        # 1. CLASS 2 (Математические игры - работают Движки)
-        # ==========================================
         
-        # Шахматы
+        # 1. Шахматы
         if "chess" in game_lower:
-            fen = board_state.get("fen", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            raw_move = self.engines.get_chess_move(fen)
-            if raw_move and len(raw_move) >= 4:
-                move_payload = {"type": "move", "from": raw_move[0:2], "to": raw_move[2:4]}
-                if len(raw_move) == 5:
-                    move_payload["promotion"] = raw_move[4]
-                return move_payload
-            # Резерв
-            if legal_moves: return random.choice(legal_moves)
+            fen = board_state.get("fen")
+            if legal_moves:
+                selected_move = None
+                if fen:
+                    try:
+                        raw_move = self.engines.get_chess_move(fen)
+                        if raw_move and len(raw_move) >= 4:
+                            f_from, f_to = raw_move[0:2], raw_move[2:4]
+                            promo = raw_move[4] if len(raw_move) == 5 else None
+                            
+                            for lm in legal_moves:
+                                if lm.get("from") == f_from and lm.get("to") == f_to:
+                                    if promo and lm.get("promotion") != promo:
+                                        continue
+                                    selected_move = lm
+                                    break
+                    except Exception as e:
+                        logger.error(f"Ошибка Stockfish: {e}")
+                
+                if not selected_move:
+                    selected_move = legal_moves[0]
+                
+                if "type" not in selected_move:
+                    selected_move["type"] = "move"
+                return selected_move
 
-        # Быки и Коровы
+        # 2. Быки и Коровы
         elif "bulls" in game_lower or "cows" in game_lower:
             if board_state.get("phase") == "setup" and not board_state.get("mySecret"):
                 secret = "".join(random.sample("0123456789", 4))
                 return {"type": "set_secret", "number": secret}
             else:
                 guess = self.engines.get_bulls_cows_move(board_state.get("oppGuesses", []))
-                if not guess: guess = "".join(random.sample("0123456789", 4))
+                if not guess:
+                    guess = "".join(random.sample("0123456789", 4))
                 return {"type": "guess", "number": str(guess)}
 
-        # Морской бой
+        # 3. Морской бой
         elif "sea battle" in game_lower or "seabattle" in game_lower:
             if board_state.get("phase") == "placing":
                 return {"type": "place", "ships": [
@@ -169,118 +173,148 @@ class LLMOrchestrator:
                 return {"type": "shot", "r": shot["r"], "c": shot["c"]}
             return {"type": "shot", "r": random.randint(0,9), "c": random.randint(0,9)}
 
-        # Шашки (Shashki / Checkers) и Реверси (Reversi)
+        # 4. Шашки и Реверси
         elif any(g in game_lower for g in ["checkers", "shashki", "reversi"]):
             if legal_moves:
                 return random.choice(legal_moves)
             if "reversi" in game_lower:
                 return {"type": "pass"}
 
-        # Пятнашки (Fifteen Puzzle)
+        # 5. Пятнашки
         elif "fifteen" in game_lower:
-            # Для пятнашек клиент должен двигать сам, бот будет слать случайный прогресс
             return {"type": "progress", "placed": random.randint(1, 15), "moves": random.randint(10, 100)}
 
-
-        # ==========================================
-        # 2. CLASS 1 (Настольные и карточные игры - Базовые правила)
-        # ==========================================
-
-        # Артиллерия (Artillery)
+        # 6. Артиллерия
         elif "artillery" in game_lower:
             return {"type": "fire", "angle": random.randint(10, 170), "power": random.randint(20, 100)}
 
-        # Камень-Ножницы-Бумага (RPS / RPSLS)
+        # 7. Камень-Ножницы-Бумага
         elif "rps" in game_lower or "rock" in game_lower:
             moves = ["r", "p", "s"]
             if "rpsls" in game_lower or "lizard" in game_lower:
                 moves.extend(["l", "v"])
             return {"type": "throw", "v": random.choice(moves)}
 
-        # Карточный Блеф (Cheat / Believe)
-        elif "cheat" in game_lower or "believe" in game_lower:
-            hand = board_state.get("hand", [])
-            if hand:
-                # Кидаем одну первую карту из руки в закрытую, заявляем ранг 0 (Шестерка)
-                return {"type": "play", "cards": [hand[0]], "rank": 0}
-            return {"type": "doubt"}
-
-        # Дурак (Durak)
+        # 8. Дурак
         elif "durak" in game_lower:
             role = board_state.get("role")
             hand = board_state.get("hand", [])
+            table = board_state.get("table", [])
+            can_attack = board_state.get("canAttack", False)
+            
+            def get_card_id(card_obj_or_int):
+                if isinstance(card_obj_or_int, dict):
+                    return card_obj_or_int.get("id", 0)
+                return int(card_obj_or_int)
+
             if role == "defender":
-                return {"type": "take"} # Бот пока глуп в Дураке, всегда забирает карты
-            elif role == "attacker" or board_state.get("canAttack"):
-                if hand:
-                    return {"type": "attack", "card": hand[0]}
-            return {"type": "done"} # non-defender
+                unbeaten_idx = None
+                for idx, bout in enumerate(table):
+                    if bout.get("d") is None:
+                        unbeaten_idx = idx
+                        break
+                
+                if unbeaten_idx is not None:
+                    target_card = get_card_id(table[unbeaten_idx]["a"])
+                    target_suit = target_card // 9
+                    target_power = target_card % 9
+                    trump_suit = board_state.get("trump", {}).get("suit", 0)
+                    
+                    best_card = None
+                    for card in hand:
+                        c_id = get_card_id(card)
+                        c_suit = c_id // 9
+                        c_power = c_id % 9
+                        if (c_suit == target_suit and c_power > target_power) or (c_suit == trump_suit and target_suit != trump_suit):
+                            best_card = c_id
+                            break
+                    
+                    if best_card is not None:
+                        return {"type": "defend", "idx": unbeaten_idx, "card": best_card}
+                    else:
+                        return {"type": "take"}
+                
+                return {"type": "done"}
 
-        # Президент (President)
-        elif "president" in game_lower:
-            return {"type": "pass"}
+            elif role == "attacker" or can_attack:
+                if not table:
+                    if hand:
+                        return {"type": "attack", "card": get_card_id(hand[0])}
+                else:
+                    table_ranks = set()
+                    for bout in table:
+                        if "a" in bout and bout["a"] is not None:
+                            table_ranks.add(get_card_id(bout["a"]) % 9)
+                        if "d" in bout and bout["d"] is not None:
+                            table_ranks.add(get_card_id(bout["d"]) % 9)
+                    
+                    for card in hand:
+                        c_id = get_card_id(card)
+                        if c_id % 9 in table_ranks:
+                            return {"type": "attack", "card": c_id}
+                
+                return {"type": "done"}
 
-        # Телепатия (The Mind)
-        elif "mind" in game_lower:
-            return {"type": "play"} # Играет самую младшую карту
-
-        # Одна волна (One Wave)
-        elif "onewave" in game_lower or "wave" in game_lower:
-            options = board_state.get("options", ["0"])
-            return {"type": "pick", "v": random.choice(options)}
-
-        # Каратека (Karateka)
-        elif "karateka" in game_lower:
-            return {"type": "act", "a": random.choice(["strike", "grab", "block"])}
-
-        # Обещания (The Pact)
-        elif "pact" in game_lower:
-            if board_state.get("phase") == "promise":
-                return {"type": "promise", "p": random.choice(["cooperate", "betray", "alternate"])}
-            return {"type": "move", "m": random.choice(["c", "d"])}
+            return {"type": "done"}
 
         # Правило (The Rule)
         elif "rule" in game_lower:
             phase = board_state.get("phase")
             role = board_state.get("role")
+            rules_list = board_state.get("rules", [{"id": "even"}])
+            
             if role == "picker" and phase == "choose":
-                rules = board_state.get("rules", [{"id":"even"}])
-                return {"type": "choose_rule", "rule": rules[0].get("id", "even")}
+                # Если мы загадываем правило, выбираем первое попавшееся из списка
+                return {"type": "choose_rule", "rule": rules_list[0].get("id", "even")}
+                
             elif phase == "probe":
-                return {"type": "probe", "n": random.randint(1, 100)}
+                if role == "guesser":
+                    probes_left = board_state.get("probesLeft", 10)
+                    
+                    # ВАЖНО: Если попытки пробы исчерпаны (probesLeft == 0), 
+                    # мы обязаны сделать финальную догадку (guess), иначе игра зависнет!
+                    if probes_left <= 0:
+                        # Выбираем случайное правило из доступного открытого списка правил
+                        chosen_rule_id = random.choice(rules_list).get("id", "even")
+                        logger.info(f"попытки закончились. Делаем финальный guess правила: {chosen_rule_id}")
+                        return {"type": "guess", "rule": chosen_rule_id}
+                    else:
+                        # Иначе продолжаем зондировать случайным числом от 1 до 100
+                        return {"type": "probe", "n": random.randint(1, 100)}
+                else:
+                    # Если мы picker в фазе probe, мы просто ждем ходов соперника
+                    return {"type": "pass"}
             else:
-                return {"type": "guess", "rule": "even"}
+                # Фоллбек-догадка
+                fallback_rule = rules_list[0].get("id", "even")
+                return {"type": "guess", "rule": fallback_rule}
 
-        # Пять в ряд (Gomoku / Five in a Row)
+        # 9. Остальные игры / Универсальный Fallback
+        elif "mind" in game_lower:
+            return {"type": "play"}
+        elif "onewave" in game_lower or "wave" in game_lower:
+            options = board_state.get("options", ["0"])
+            return {"type": "pick", "v": random.choice(options)}
+        elif "karateka" in game_lower:
+            return {"type": "act", "a": random.choice(["strike", "grab", "block"])}
+        elif "pact" in game_lower:
+            if board_state.get("phase") == "promise":
+                return {"type": "promise", "p": random.choice(["cooperate", "betray", "alternate"])}
+            return {"type": "move", "m": random.choice(["c", "d"])}
         elif "gomoku" in game_lower or "five" in game_lower:
-            # Случайная клетка 15x15. Если занята - сервер откажет и бот попробует снова
             return {"type": "move", "r": random.randint(0, 14), "c": random.randint(0, 14)}
-
-        # Точки-Тире (Dots and Boxes)
         elif "dots" in game_lower or "boxes" in game_lower:
-            # Случайная грань. Если занята - бот будет подбирать до победного
             n = board_state.get("n", 4)
             return {"type": "edge", "kind": random.choice(["h", "v"]), "r": random.randint(0, n-1), "c": random.randint(0, n-1)}
-
-        # Слепые танки (Blind Tanks)
         elif "tank" in game_lower:
-            # В танках нельзя стоять на месте.
             return {"type": "move", "dx": random.choice([-1, 1]), "dy": random.choice([-1, 0, 1])}
-
-        # Три фронта (Three Fronts)
         elif "three" in game_lower or "fronts" in game_lower:
-            # Нужно распределить 13 юнитов
             return {"type": "split", "a": 4, "b": 4, "c": 5}
 
-
-        # ==========================================
-        # УНИВЕРСАЛЬНЫЙ СПАСАТЕЛЬНЫЙ КРУГ
-        # ==========================================
         if legal_moves:
             fallback = random.choice(legal_moves)
             if isinstance(fallback, dict) and "type" not in fallback:
                 fallback["type"] = "move"
             return fallback
 
-        logger.warning(f"Игра '{game_type}' полностью неизвестна. Пропускаем ход (pass).")
         return {"type": "pass"}

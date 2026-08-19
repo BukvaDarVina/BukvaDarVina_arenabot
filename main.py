@@ -58,7 +58,7 @@ async def main():
                     
             if not target_table_id:
                 logger.info("Свободных столов нет. Создаем собственный...")
-                target_table_id = await client.create_table("chess")
+                target_table_id = await client.create_table("")
                 
             if target_table_id:
                 # 2. Проверяем, не посадил ли нас сервер автоматически при создании стола

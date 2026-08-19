@@ -134,7 +134,7 @@ class ArenaClient:
         return []
 
     async def create_table(self, game_type: Optional[str] = None) -> Optional[str]:
-        """Создает стол для указанной игры, а если не указана — берет случайную!"""
+        """Создает стол для случайной игры из каталога Арены или для конкретной, если указано"""
         try:
             headers = self._get_auth_headers()
             
@@ -142,28 +142,26 @@ class ArenaClient:
             if seated:
                 return seated
 
-            # Если игру не передали жестко, запрашиваем список у платформы и берем любую
+            # Если игра не передана явно, берем рандом из каталога /api/games
             if not game_type:
-                games_resp = await self.client.get("/api/games", headers=headers)
-                if games_resp.status_code == 200:
-                    games_data = games_resp.json()
-                    if isinstance(games_data, list) and games_data:
-                        import random
-                        # Берем случайную игру из списка доступных!
-                        game_info = random.choice(games_data)
-                        game_type = game_info.get("name", "chess").lower()
-                    elif isinstance(games_data, dict) and "games" in games_data:
-                        available = games_data["games"]
-                        if available:
+                try:
+                    games_resp = await self.client.get("/api/games", headers=headers)
+                    if games_resp.status_code == 200:
+                        data = games_resp.json()
+                        games_list = data.get("games", [])
+                        if games_list:
                             import random
-                            chosen = random.choice(available)
-                            game_type = chosen.lower() if isinstance(chosen, str) else chosen.get("name", "chess").lower()
-            
-            # Если Апи недоступно, фоллбек на шахматы
-            game_type = game_type or "chess"
+                            chosen_game = random.choice(games_list)
+                            # Каждая игра в ответе имеет поле "id" (например, "chess", "bulls", "seabattle", "artillery")
+                            game_type = chosen_game.get("id") or chosen_game.get("name")
+                except Exception as e:
+                    logger.warning(f"Не удалось получить список игр, фоллбек на шахматы: {e}")
 
-            payload = {"game": game_type.lower()}
-            logger.info(f"Случайный выбор! Создаем стол для игры: '{payload['game']}'...")
+            # Если по какой-то причине список недоступен, фоллбек на chess
+            game_type = game_type or "chess"
+            payload = {"game": str(game_type).lower()}
+            
+            logger.info(f"Создаем новый стол для случайной игры: '{payload['game']}'...")
             
             response = await self.client.post("/api/tables", json=payload, headers=headers)
             if response.status_code in (200, 201):
@@ -254,3 +252,56 @@ class ArenaClient:
         
     async def close(self) -> None:
         await self.client.aclose()
+
+    async def generate_chat_comment(self, game_name: str, last_move: str, my_role: str) -> str:
+        """Генерирует осмысленную реплику через локальную Ollama"""
+        import httpx
+        ollama_url = "http://host.docker.internal:11434/api/generate" # Или ваш адрес Ollama
+        
+        prompt = (
+            f"Ты играешь в игру '{game_name}' на игровой арене. "
+            f"Соперник только что сделал ход: '{last_move}'. Твоя роль: {my_role}. "
+            f"Напиши короткую, дерзкую или остроумную реплику на русском языке для чата с противником. "
+            f"Не пиши ничего, кроме самой фразы, максимум 1-2 предложения."
+        )
+        
+        payload = {
+            "model": "llama3", # Или ваша модель, например "mistral" или "phi3"
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.7}
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(ollama_url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("response", "").strip('" \n')
+        except Exception as e:
+            logger.debug(f"Ollama недоступна для чата: {e}")
+            
+        # Запасные фразы, если Ollama молчит
+        fallbacks = [
+            "Интересный ход, но я просчитал его на 5 шагов вперед.",
+            "Хм, дерзко. Посмотрим, что ты сделаешь дальше.",
+            "Машина думает... хотя победа уже за мной.",
+            "Неплохо, неплохо!"
+        ]
+        import random
+        return random.choice(fallbacks)
+
+    async def send_chat_message(self, table_id: str, message: str) -> bool:
+        """Отправляет реплику в чат текущего матча"""
+        headers = self._get_auth_headers()
+        chat_url = f"/api/matches/{table_id}/chat"
+        payload = {"message": message}
+        
+        try:
+            response = await self.client.post(chat_url, json=payload, headers=headers)
+            if response.status_code in (200, 201):
+                logger.info(f"💬 Сказали в чат: '{message}'")
+                return True
+        except Exception as e:
+            logger.debug(f"Не удалось отправить сообщение в чат: {e}")
+        return False
