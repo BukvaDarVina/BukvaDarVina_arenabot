@@ -1,0 +1,8 @@
+{ 
+    "tools": { "webSearch": { "enabled": true, "model": "qwen3:14b" } }, 
+    "modelProviders": { 
+      "openai": [{ "id": "qwen3:14b", 
+        "baseUrl": "http://localhost:11434/v1", 
+        "envKey": "DASHSCOPE_API_KEY" }] 
+    } 
+  }
