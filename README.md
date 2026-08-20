@@ -1,32 +1,129 @@
---- a/original.md
-+++ b/original.md
-@@ -1,12 +1,12 @@
--🏆 Arena Champion Bot
-+🏆 Arena Champion Bot
+# Arena Champion Bot
 
-## 🎯 Цели проекта
--Создание сильнейшего бота для игровой платформы https://arena.roomcomm.xyz[cite: 2]. Бот использует гибридную архитектуру «Франкенштейн»: языковая модель (LLM) выступает в роли оркестратора для общения с лобби и парсинга, а для принятия решений по ходам используются классические математические движки[cite: 8, 59]. Это исключает галлюцинации LLM в долгих партиях[cite: 7]. Конечная цель — побеждать лидеров турнирной таблицы в рейтинговых играх, таких как `hermes-agent`, `SSE-SRB` и `MatrixZ from SRB`[cite: 27].
-+Create a strong bot for the game platform https://arena.roomcomm.xyz. The bot uses a hybrid architecture called "Frankenstein": a language model (LLM) serves as an orchestrator for communication with the lobby and parsing, while classical mathematical engines are used to make decisions about moves. This eliminates hallucinations in long games.
+Автоматический бот для игровой платформы [arena.roomcomm.xyz](https://arena.roomcomm.xyz), использующий гибридную архитектуру: LLM-оркестратор управляет лобби и парсингом состояний, а классические математические движки рассчитывают ходы. Это исключает галлюцинации LLM при игре.
 
--The ultimate goal is to defeat leaders on the tournament table in rating games such as `hermes-agent`, `SSE-SRB` and `MatrixZ from SRB`.
-+
+## Архитектура
 
-## 🛠 Стек технологий
--**Язык:** Python 3.14.6
--**Протоколы связи:** HTTP-запросы и MCP (Model Context Protocol)[cite: 11].
--**Мышцы (Игровые движки):**
--  - **Шахматы:** Консольный движок Stockfish через протокол UCI[cite: 14].
--  - **Быки и коровы:** Алгоритм Кнута (математическая гарантия победы максимум за 5 ходов)[cite: 17].
--  - **Морской бой:** Карта плотности вероятности (Probability Density Grid)[cite: 18].
--  - **Реверси и Гомоку:** Минимакс с альфа-бета отсечением[cite: 16].
--**Память (Обучение / Opponent Profiling):** Локальная БД (PostgreSQL или SQLite) для хранения логов завершенных матчей и даптации вероятностей под конкретных противников[cite: 43].
-+**Language:** Python 3.14.6
-+**Protocols:** HTTP requests and MCP (Model Context Protocol)
-+**Engines:**
-+	+ Chess: Stockfish console engine through UCI protocol
-+	+ Goats and Cows: Knuth's algorithm (mathematical guarantee of victory within 5 moves)
-+	+ Battleship: Probability Density Grid
-+	+ Reversi and Gomoku: Minimax with alpha-beta pruning
+```
+┌─────────────────────────────────────────────────┐
+│  main.py  — точка входа, игровой цикл           │
+├──────────┬──────────────┬───────────────────────┤
+│  core/   │  engines/    │  parsers/             │
+│  client  │  chess_engine│  translator           │
+│  orchestr│  bulls_cows  │  regex_parser         │
+├──────────┴──────────────┴───────────────────────┤
+│  memory/ — SQLite для логов и профилей соперников│
+└─────────────────────────────────────────────────┘
+```
 
-## 📂 Структура каталогов
+**Поток данных:** `Arena API` → `ArenaClient` → `GameStateTranslator` → `EngineManager` → ход отправляется обратно.
 
+## Игровые движки
+
+| Игра | Движок | Алгоритм |
+|------|--------|----------|
+| Шахматы | Stockfish | UCI-протокол |
+| Быки и коровы | `BullsAndCowsEngine` | Алгоритм Кнута (гарантия победы ≤ 5 ходов) |
+| Морской бой | `SeaBattleEngine` | Probability Density Grid |
+| Реверси | `ReversiEngine` | Минимакс с альфа-бета отсечением |
+| Гомоку | `GomokuEngine` | Минимакс с альфа-бета отсечением |
+| Шашки | `CheckersEngine` | Случайный легальный ход |
+| Гомино (Dots & Boxes) | `DotsBoxesEngine` | Случайный ход |
+| Дурак | `DurakEngine` | Базовая логика атакующего/защитника |
+| Камень-ножницы-бумага | `RockPaperScissorsEngine` | Случайный выбор |
+| Пакт | `PactEngine` | Случайное сотрудничество/предательство |
+| Правило, Танк, Каратель и др. | Базовые движки | Эвристики / случайные ходы |
+
+## Стек технологий
+
+- **Язык:** Python 3.14
+- **HTTP-клиент:** httpx (async)
+- **Движок шахмат:** Stockfish (UCI)
+- **LLM для чата:** Ollama (опционально)
+- **Валидация данных:** Pydantic v2
+- **БД:** SQLite (local)
+- **Тестирование:** pytest, pytest-asyncio, pytest-httpx, pytest-mock
+- **Контейнеризация:** Docker
+
+## Структура каталогов
+
+```
+.
+├── core/
+│   ├── client.py          # HTTP-клиент для API арены
+│   └── orchestrator.py    # Оркестрация игрового процесса
+├── engines/
+│   ├── manager.py         # Фасад для всех игровых движков
+│   ├── chess_engine.py    # Stockfish через UCI
+│   ├── bulls_cows_engine.py
+│   ├── sea_battle_engine.py
+│   ├── reversi_engine.py
+│   └── ...
+├── parsers/
+│   ├── translator.py      # Роутер текстовых состояний
+│   └── regex_parser.py    # Regex-паттерны для 7 типов игр
+├── memory/
+│   └── db.py              # SQLite: логи матчей, профили соперников
+├── tests/
+│   ├── conftest.py
+│   ├── test_client.py
+│   ├── test_engines.py
+│   ├── test_parsers.py
+│   ├── test_orchestrator.py
+│   └── test_memory.py
+├── data/                  # SQLite-БД и токен агента
+├── main.py                # Точка входа
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
+```
+
+## Быстрый старт
+
+### Локально
+
+```bash
+# 1. Клонировать репозиторий
+git clone https://github.com/user/BukvaDarVina_arenabot.git
+cd BukvaDarVina_arenabot
+
+# 2. Создать виртуальное окружение
+python -m venv venv
+source venv/bin/activate   # Linux / macOS
+venv\Scripts\activate      # Windows
+
+# 3. Установить зависимости
+pip install -r requirements.txt
+
+# 4. Запустить
+python main.py
+```
+
+### Docker
+
+```bash
+docker-compose up --build
+```
+
+Контейнер автоматически перезапускается (`restart: always`). Данные сохраняются в `./data/`.
+
+## Конфигурация
+
+| Переменная | По умолчанию | Описание |
+|------------|--------------|----------|
+| `AGENT_TOKEN` | *(пусто)* | Токен API агента. Если не задан, берётся из `data/token.txt` |
+| `OLLAMA_HOST` | `http://host.docker.internal:11434` | URL сервиса Ollama для генерации чата |
+| `TZ` | `UTC` | Часовой пояс |
+
+## Тестирование
+
+```bash
+pip install -r tests/requirements-test.txt
+pytest
+```
+
+Тесты покрывают: парсеры, клиент (HTTP-мокинг), все игровые движки, базу данных и интеграционный сценарий полного матча.
+
+## Поддерживаемые игры
+
+Бот автоматически определяет тип игры по текстовому состоянию и выбирает соответствующий движок. В настоящее время полностью реализованы **шахматы** (Stockfish) и **быки и коровы** (Кнут). Остальные движки находятся на стадии доработки.
